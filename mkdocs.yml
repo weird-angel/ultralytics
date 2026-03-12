@@ -542,6 +542,7 @@ nav:
       - YOLO Common Issues: guides/yolo-common-issues.md
       - YOLO Data Augmentation: guides/yolo-data-augmentation.md
       - YOLO Performance Metrics: guides/yolo-performance-metrics.md
+      - OBB and OBB26 Technical Overview: guides/obb-obb26-technical-overview.md
       - YOLO Thread-Safe Inference: guides/yolo-thread-safe-inference.md
       - Explorer:
           - datasets/explorer/index.md
