@@ -91,7 +91,7 @@ The rotation angle $\theta$ in oriented bounding boxes has multiple definition c
 #### 3.1.1 OpenCV Convention
 
 `cv2.minAreaRect` returns $\theta \in [-90°, 0°)$:
-- Defined as the angle between the **longest edge** and the horizontal axis;
+- Defined as the **clockwise** angle from the positive x-axis to the **"width" edge** of the returned rectangle; the "width" edge is whichever side OpenCV associates with that angle and is **not guaranteed to be the longer side**;
 - Clockwise rotation is negative; a horizontal box returns $\theta = 0°$; rotating to vertical approaches $\theta = -90°$.
 
 #### 3.1.2 Short-Edge Counter-Clockwise Convention
@@ -128,9 +128,103 @@ The OBB26 head outputs **raw, unconstrained angle predictions** without Sigmoid 
 
 **Core challenge**: The $180°$ periodicity of rectangles (angle $\theta$ and $\theta + 180°$ produce identical boxes) creates "multi-solution" ambiguity in regression targets. This inconsistency during gradient backpropagation leads to training instability—a fundamental problem that motivates most angle-aware loss design.
 
+#### 3.1.6 Why the YOLO xywhr Angle Is [-45°, 135°) Instead of [-90°, 0°)
+
+The YOLO internal representation (`xywhr`) is produced by `xyxyxyxy2xywhr` (`ultralytics/utils/ops.py`), which calls `cv2.minAreaRect` and then applies two transformations:
+
+**Step 1 — OpenCV baseline**
+
+```python
+(cx, cy), (w, h), angle = cv2.minAreaRect(pts)
+theta = angle / 180 * np.pi          # degrees → radians; theta ∈ [-π/2, 0)
+```
+
+OpenCV returns `angle ∈ [-90°, 0°)`. The "width" `w` in the result can be either the longer **or** shorter dimension — OpenCV imposes no constraint on which is larger.
+
+**Step 2 — Enforce w ≥ h (long side is always called w)**
+
+```python
+if w < h:
+    w, h = h, w
+    theta += np.pi / 2   # the new long axis is 90° away from the old one
+```
+
+When OpenCV's `w < h`, the "width" edge is actually the shorter side. YOLO swaps the labels so that `w` always denotes the longer dimension. Geometrically, the longer edge's angle is exactly 90° greater than the shorter edge's angle, so `theta += π/2` corrects the direction reference.
+
+After the conditional swap:
+
+| Case | OpenCV output | theta after swap |
+|------|--------------|-----------------|
+| `w ≥ h` already | `w ≥ h`, `angle ∈ [-90°, 0°)` | `theta ∈ [-π/2, 0)` |
+| `w < h` (swap) | `w < h`, `angle ∈ [-90°, 0°)` | `theta ∈ [0, π/2)` |
+
+**Step 3 — Normalize to [-π/4, 3π/4)**
+
+```python
+while theta >= 3 * np.pi / 4:
+    theta -= np.pi          # wrap down from above 135°
+while theta < -np.pi / 4:
+    theta += np.pi          # wrap up from below -45°
+```
+
+Applying these loops to each range from Step 2:
+
+| theta before loops | Result after loops |
+|-------------------|-------------------|
+| `[-π/2, -π/4)` (no-swap, steep angle) | `+π` → `[π/2, 3π/4)` i.e. `[90°, 135°)` |
+| `[-π/4, 0)` (no-swap, shallow angle) | unchanged → `[-π/4, 0)` i.e. `[-45°, 0°)` |
+| `[0, π/2)` (after swap) | unchanged → `[0, π/2)` i.e. `[0°, 90°)` |
+
+Combined final range: $[-\pi/4,\ 0) \cup [0,\ \pi/2) \cup [\pi/2,\ 3\pi/4) = [-\pi/4,\ 3\pi/4)$, i.e. **[-45°, 135°)**.
+
+**Summary of the key difference**
+
+OpenCV's angle describes the orientation of whichever edge it internally labels as the "width" (may be the short side). YOLO's angle always describes the orientation of the **long side** (`w ≥ h`). This semantic redefinition—together with the compensating +90° shift and the normalization loops—transforms OpenCV's `[-90°, 0°)` into YOLO's `[-45°, 135°)`.
+
+The sigmoid formula in the OBB detection head, `(sigmoid(x) − 0.25) × π`, was designed to exactly match this output range:
+
+$$
+\sigma(x) \in (0,\ 1) \;\Longrightarrow\; (\sigma(x) - 0.25)\pi \in (-\tfrac{\pi}{4},\ \tfrac{3\pi}{4})
+$$
+
 ### 3.2 OBB Implementation in YOLO
 
-#### 3.2.1 Detection Head Architecture
+#### 3.2.1 Label Conversion: 4-Corner Points → xywhr (`xyxyxyxy2xywhr`)
+
+The full conversion from annotation 4-corner format to the internal `xywhr` representation is in `ultralytics/utils/ops.py`:
+
+```python
+def xyxyxyxy2xywhr(x):
+    """Convert [xy1,xy2,xy3,xy4] (N,8) → [cx,cy,w,h,theta] (N,5), theta in [-pi/4, 3pi/4)."""
+    is_torch = isinstance(x, torch.Tensor)
+    points = x.cpu().numpy() if is_torch else x
+    points = points.reshape(len(x), -1, 2)
+    rboxes = []
+    for pts in points:
+        # Step 1: call OpenCV — returns angle in [-90°, 0°), w may be < h
+        (cx, cy), (w, h), angle = cv2.minAreaRect(pts)
+
+        # Step 2: convert degrees → radians
+        theta = angle / 180 * np.pi                      # theta ∈ [-π/2, 0)
+
+        # Step 3: enforce w >= h (long axis is always w)
+        if w < h:
+            w, h = h, w
+            theta += np.pi / 2                           # long axis is 90° away
+
+        # Step 4: normalize to [-π/4, 3π/4)
+        while theta >= 3 * np.pi / 4:
+            theta -= np.pi
+        while theta < -np.pi / 4:
+            theta += np.pi
+
+        rboxes.append([cx, cy, w, h, theta])
+    return torch.tensor(rboxes, ...) if is_torch else np.asarray(rboxes)
+```
+
+This is the direct reason why YOLO's xywhr angle is in **[-45°, 135°)** rather than OpenCV's [-90°, 0°) — see Section 3.1.6 for a detailed walkthrough.
+
+#### 3.2.2 Detection Head Architecture
 
 In `ultralytics/nn/modules/head.py`, the `OBB` class extends `Detect` with a dedicated angle prediction branch:
 
@@ -156,7 +250,7 @@ def forward_head(self, x, box_head, cls_head, angle_head):
     preds["angle"] = angle
 ```
 
-#### 3.2.2 Rotated Box Decoding (`dist2rbox`)
+#### 3.2.3 Rotated Box Decoding (`dist2rbox`)
 
 YOLO uses the **Distribution Focal Loss (DFL)** framework, predicting box parameters as distance distributions from anchor points (ltrb). For rotated boxes, the `dist2rbox` function handles decoding:
 
@@ -172,7 +266,7 @@ def dist2rbox(pred_dist, pred_angle, anchor_points, dim=-1):
 
 This decodes predicted ltrb distances and angle into rotated box center and dimensions in `xywh` format.
 
-#### 3.2.3 NMS Post-processing
+#### 3.2.4 NMS Post-processing
 
 Rotated NMS uses **Probabilistic IoU (probiou)** for efficient rotated box IoU computation, avoiding expensive polygon intersection calculations:
 

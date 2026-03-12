@@ -91,7 +91,7 @@ OBB26 是 Ultralytics YOLO26 系列中用于旋转目标检测的检测头变体
 #### 3.1.1 OpenCV 规范
 
 `cv2.minAreaRect` 返回 $\theta \in [-90°, 0°)$：
-- 定义为**最长边**与水平轴之间的夹角；
+- 定义为从正 x 轴（水平向右）**顺时针**旋转到返回矩形的**"width"边**所经过的角度；**"width"边不一定是最长边**，OpenCV 对此没有约束；
 - 顺时针方向为负；水平放置的框返回 $\theta = 0°$；旋转至竖直方向时 $\theta$ 趋向 $-90°$。
 
 #### 3.1.2 短边逆时针规范
@@ -128,9 +128,103 @@ OBB26 检测头输出**原始、无约束的角度预测值**，不施加 Sigmoi
 
 **核心挑战**：矩形框具有 $180°$ 旋转对称性（角度 $\theta$ 与 $\theta + 180°$ 对应完全相同的框），导致回归目标存在"多解性"歧义。这一不一致性在梯度反传时引起训练不稳定，是大多数角度感知损失函数设计的根本动机。
 
+#### 3.1.6 为什么 YOLO 的 xywhr 角度范围是 [-45°, 135°) 而不是 [-90°, 0°)?
+
+YOLO 的 `xyxyxyxy2xywhr`（`ultralytics/utils/ops.py`）函数将 4 角点格式转换为 `xywhr`，其中依次执行以下步骤，导致最终角度范围从 OpenCV 的 $[-90°, 0°)$ 变为 $[-45°, 135°)$。
+
+**第 1 步 — 调用 OpenCV**
+
+```python
+(cx, cy), (w, h), angle = cv2.minAreaRect(pts)
+theta = angle / 180 * np.pi   # 度 → 弧度；theta ∈ [-π/2, 0)
+```
+
+OpenCV 返回 `angle ∈ [-90°, 0°)`，其对应的 `w` 是 OpenCV 内部定义的"width"边，**可能是短边也可能是长边**，没有保证 `w >= h`。
+
+**第 2 步 — 强制 w ≥ h（长边始终称为 w）**
+
+```python
+if w < h:
+    w, h = h, w
+    theta += np.pi / 2   # 现在参考的是长边，其方向比短边多 90°
+```
+
+当 OpenCV 的 `w < h` 时，"width"边实际上是短边。YOLO 交换 `w` 和 `h`，使 `w` 始终对应长边（物体的主要延伸方向）。几何上，长边与短边方向相差 90°，因此 `theta += π/2`。
+
+交换后各情形下 theta 的范围：
+
+| 情形 | OpenCV 输出 | 交换后 theta |
+|------|------------|------------|
+| `w ≥ h`（无需交换） | `w ≥ h`，`angle ∈ [-90°, 0°)` | `theta ∈ [-π/2, 0)` |
+| `w < h`（需要交换） | `w < h`，`angle ∈ [-90°, 0°)` | `theta ∈ [0, π/2)` |
+
+**第 3 步 — 归一化到 [-π/4, 3π/4)**
+
+```python
+while theta >= 3 * np.pi / 4:
+    theta -= np.pi        # 从 135° 以上向下折叠
+while theta < -np.pi / 4:
+    theta += np.pi        # 从 -45° 以下向上折叠
+```
+
+对第 2 步中各范围应用归一化循环的结果：
+
+| 归一化前 theta | 归一化后结果 |
+|--------------|------------|
+| `[-π/2, -π/4)` 即 `[-90°, -45°)`（无交换，角度较陡） | `+π` → `[π/2, 3π/4)` 即 `[90°, 135°)` |
+| `[-π/4, 0)` 即 `[-45°, 0°)`（无交换，角度较浅） | 不变，保持 `[-π/4, 0)` |
+| `[0, π/2)` 即 `[0°, 90°)`（交换后） | 不变，保持 `[0, π/2)` |
+
+合并后的最终范围：$[-\pi/4,\ 0) \cup [0,\ \pi/2) \cup [\pi/2,\ 3\pi/4) = [-\pi/4,\ 3\pi/4)$，即 **[-45°, 135°)**。
+
+**核心区别总结**
+
+| 项目 | OpenCV 角度 | YOLO xywhr 角度 |
+|------|-----------|---------------|
+| 参考边 | OpenCV 内部的"width"边（不保证是长边） | 始终是**长边**（`w ≥ h`） |
+| 角度范围 | $[-90°, 0°)$ | $[-45°, 135°)$ |
+| 范围变化原因 | — | 长边方向 = 短边方向 ± 90°，加上归一化循环 |
+
+OBB 检测头的 Sigmoid 公式 `(sigmoid(x) - 0.25) × π` 正是为了与这一范围严格对齐：
+
+$$
+\sigma(x) \in (0,\ 1) \;\Longrightarrow\; (\sigma(x) - 0.25)\pi \in \left(-\frac{\pi}{4},\ \frac{3\pi}{4}\right)
+$$
+
 ### 3.2 OBB 在 YOLO 中的实现要点
 
-#### 3.2.1 检测头结构
+#### 3.2.1 标签转换：4 角点格式 → xywhr（`xyxyxyxy2xywhr`）
+
+从标注 4 角点格式到内部 `xywhr` 表示的完整转换代码位于 `ultralytics/utils/ops.py`：
+
+```python
+def xyxyxyxy2xywhr(x):
+    """将 [xy1,xy2,xy3,xy4] (N,8) 转换为 [cx,cy,w,h,theta] (N,5)，theta ∈ [-pi/4, 3pi/4)"""
+    ...
+    for pts in points:
+        # 第 1 步：调用 OpenCV，返回 angle ∈ [-90°, 0°)，w 不保证 >= h
+        (cx, cy), (w, h), angle = cv2.minAreaRect(pts)
+
+        # 第 2 步：度 → 弧度
+        theta = angle / 180 * np.pi                       # theta ∈ [-π/2, 0)
+
+        # 第 3 步：强制 w >= h（长边始终称为 w）
+        if w < h:
+            w, h = h, w
+            theta += np.pi / 2   # 长边方向 = 短边方向 + 90°
+
+        # 第 4 步：归一化到 [-π/4, 3π/4)
+        while theta >= 3 * np.pi / 4:
+            theta -= np.pi
+        while theta < -np.pi / 4:
+            theta += np.pi
+
+        rboxes.append([cx, cy, w, h, theta])
+```
+
+这正是 YOLO xywhr 角度范围为 **[-45°, 135°)** 而非 OpenCV 的 [-90°, 0°) 的直接原因——详见第 3.1.6 节的逐步推导。
+
+#### 3.2.2 检测头结构
 
 在 `ultralytics/nn/modules/head.py` 中，`OBB` 类继承自 `Detect`，增加了专用的角度预测分支：
 
@@ -156,7 +250,7 @@ def forward_head(self, x, box_head, cls_head, angle_head):
     preds["angle"] = angle
 ```
 
-#### 3.2.2 旋转框解码（`dist2rbox`）
+#### 3.2.3 旋转框解码（`dist2rbox`）
 
 YOLO 采用**分布式焦点损失（DFL）**框架，将框参数预测为从锚点出发的距离分布（ltrb 格式）。针对旋转框，通过 `dist2rbox` 函数完成解码：
 
@@ -172,7 +266,7 @@ def dist2rbox(pred_dist, pred_angle, anchor_points, dim=-1):
 
 该函数将预测的 ltrb 距离与角度解码为旋转框的中心坐标和宽高（`xywh` 格式）。
 
-#### 3.2.3 NMS 后处理
+#### 3.2.4 NMS 后处理
 
 旋转框的非极大值抑制（NMS）采用**概率 IoU（probiou）**进行高效的旋转框 IoU 计算，避免了代价高昂的多边形交集计算：
 
