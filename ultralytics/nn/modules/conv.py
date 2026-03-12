@@ -22,6 +22,7 @@ __all__ = (
     "GhostConv",
     "Index",
     "LightConv",
+    "OAConv",
     "RepConv",
     "SpatialAttention",
 )
@@ -197,6 +198,67 @@ class DWConv(Conv):
             act (bool | nn.Module): Activation function.
         """
         super().__init__(c1, c2, k, s, g=math.gcd(c1, c2), d=d, act=act)
+
+
+class OAConv(nn.Module):
+    """Oriented Axial Convolution module.
+
+    Replaces a standard k×k 2D depthwise convolution with a pair of oriented 1D depthwise convolutions:
+    one horizontal (1×k) and one vertical (k×1). The outputs are summed, followed by batch normalization
+    and an activation function. This captures directional spatial context with fewer parameters than a
+    full 2D depthwise kernel.
+
+    Inspired by "Convolutional Networks with Oriented 1D Kernels" (ICCV 2023).
+    https://arxiv.org/abs/2309.15812
+
+    Attributes:
+        conv_h (nn.Conv2d): Horizontal 1×k depthwise convolution.
+        conv_v (nn.Conv2d): Vertical k×1 depthwise convolution.
+        bn (nn.BatchNorm2d): Batch normalization layer.
+        act (nn.Module): Activation function.
+        default_act (nn.Module): Default activation (SiLU).
+    """
+
+    default_act = nn.SiLU()
+
+    def __init__(self, c1, c2, k=7, act=True):
+        """Initialize OAConv with horizontal and vertical 1D depthwise convolutions.
+
+        Args:
+            c1 (int): Number of input channels. Must equal c2 (depthwise operation).
+            c2 (int): Number of output channels. Must equal c1.
+            k (int): Length of the 1D kernel. Must be odd. Defaults to 7.
+            act (bool | nn.Module): Activation function. True uses default SiLU.
+        """
+        super().__init__()
+        assert c1 == c2, "OAConv requires equal input and output channels for depthwise operation"
+        assert k % 2 == 1, f"OAConv kernel size k must be odd for symmetric same-size padding, got k={k}"
+        self.conv_h = nn.Conv2d(c1, c1, (1, k), stride=1, padding=(0, k // 2), groups=c1, bias=False)
+        self.conv_v = nn.Conv2d(c1, c1, (k, 1), stride=1, padding=(k // 2, 0), groups=c1, bias=False)
+        self.bn = nn.BatchNorm2d(c2)
+        self.act = self.default_act if act is True else act if isinstance(act, nn.Module) else nn.Identity()
+
+    def forward(self, x):
+        """Apply oriented 1D depthwise convolutions, batch normalization and activation.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            (torch.Tensor): Output tensor.
+        """
+        return self.act(self.bn(self.conv_h(x) + self.conv_v(x)))
+
+    def forward_fuse(self, x):
+        """Apply oriented 1D depthwise convolutions and activation without batch normalization.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            (torch.Tensor): Output tensor.
+        """
+        return self.act(self.conv_h(x) + self.conv_v(x))
 
 
 class DWConvTranspose2d(nn.ConvTranspose2d):
