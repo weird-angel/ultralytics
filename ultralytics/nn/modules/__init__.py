@@ -81,6 +81,7 @@ from .conv import (
     OAConv,
     RepConv,
     SpatialAttention,
+    make_cyclic_angles,
 )
 from .head import (
     OBB,
@@ -198,5 +199,6 @@ __all__ = (
     "YOLOEDetect",
     "YOLOESegment",
     "YOLOESegment26",
+    "make_cyclic_angles",
     "v10Detect",
 )

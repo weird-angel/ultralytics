@@ -26,6 +26,7 @@ __all__ = (
     "OAConv",
     "RepConv",
     "SpatialAttention",
+    "make_cyclic_angles",
 )
 
 
@@ -262,6 +263,40 @@ class OAConv(nn.Module):
         return self.act(self.conv_h(x) + self.conv_v(x))
 
 
+def make_cyclic_angles(channels: int, N: int = 8, layer_offset: float = 0.0) -> list:
+    """Compute per-channel initial angles cycling evenly through N orientations.
+
+    Implements the ``channel_cycle_offset`` + ``theta_offset`` convention from the Oriented1D paper
+    (Kirchmeyer & Deng, ICCV 2023, https://arxiv.org/abs/2309.15812).  Channels are divided into N
+    equal groups; all channels in group ``n`` share angle ``n/N * π`` radians.  An optional
+    ``layer_offset`` of ``0.5`` adds a 90° shift for odd-depth layers, matching
+    ``layer_wise_rotation_offset(enable_layer_cycle=True)`` from the reference code.
+
+    Args:
+        channels (int): Number of channels.
+        N (int): Number of equally-spaced direction groups in ``[0, π)``. Default: 8.
+        layer_offset (float): Fractional orientation offset added before angle conversion.
+            ``0.0`` = no shift, ``0.5`` = +90° shift for alternating layers. Default: 0.0.
+
+    Returns:
+        (list[float]): Angle in radians for each channel, length ``channels``.
+
+    Examples:
+        >>> angles = make_cyclic_angles(64, N=8)                    # 8 groups of 8 channels
+        >>> angles = make_cyclic_angles(64, N=8, layer_offset=0.5)  # same, shifted 90°
+    """
+    return [
+        math.pi
+        * (
+            # Wrap to [0, 1) BEFORE multiplying by π, then convert to radians.
+            # Group index n: channels split into N groups; n = floor((N*(c+1)-1) / channels)
+            (((N * (c + 1) - 1) // channels) / N + layer_offset)
+            % 1
+        )
+        for c in range(channels)
+    ]
+
+
 class DWOConv1d(nn.Module):
     """Depthwise Oriented 1D Convolution — pure-PyTorch implementation.
 
@@ -302,9 +337,11 @@ class DWOConv1d(nn.Module):
         Args:
             channels (int): Number of input and output channels (depthwise — in == out).
             k (int): 1D kernel length.  Must be odd.  Defaults to 7.
-            angle (float | torch.Tensor): Initial rotation angle(s) in radians.  A scalar initialises
-                all channels to the same angle; a ``(channels,)`` tensor sets per-channel angles.
-                Defaults to 0.0 (horizontal kernels).
+            angle (float | list | torch.Tensor): Initial rotation angle(s) in radians.  A scalar
+                initialises all channels to the same angle; a sequence of length ``channels`` sets
+                per-channel angles.  Use :func:`make_cyclic_angles` to initialise channels across
+                N evenly-spaced directions following the Oriented1D paper convention.
+                Defaults to 0.0 (all channels start horizontal).
             act (bool | nn.Module): Activation function.  ``True`` uses default SiLU.
         """
         super().__init__()
@@ -320,7 +357,7 @@ class DWOConv1d(nn.Module):
         if isinstance(angle, (float, int)):
             angle_t = torch.full((channels,), float(angle))
         else:
-            angle_t = torch.as_tensor(angle, dtype=torch.float32).reshape(channels)
+            angle_t = torch.as_tensor(list(angle), dtype=torch.float32).reshape(channels)
         self.theta = nn.Parameter(angle_t)
 
         self.bn = nn.BatchNorm2d(channels)
@@ -343,9 +380,8 @@ class DWOConv1d(nn.Module):
         half = k // 2
         device = x.device
 
-        # Explicit float division to avoid precision issues with integer H/W
-        norm_w = float(W) / 2.0
-        norm_h = float(H) / 2.0
+        norm_w = W / 2.0  # normalisation factor for x-axis grid coords
+        norm_h = H / 2.0  # normalisation factor for y-axis grid coords
 
         offsets = torch.arange(-half, half + 1, dtype=x.dtype, device=device)  # (k,)
         cos_t = torch.cos(self.theta).to(x.dtype)  # (C,)

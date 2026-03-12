@@ -1,21 +1,19 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
-# YOLO11 object detection model with Depthwise Oriented 1D (DWOConv1d) backbone blocks.
+# YOLO11 object detection model with oriented 1D convolution (DWOConv1d) backbone blocks.
 #
-# This model implements the full learnable-angle depthwise oriented 1D convolution from:
-#   "Convolutional Networks with Oriented 1D Kernels", Kirchmeyer & Deng, ICCV 2023.
-#   https://arxiv.org/abs/2309.15812
+# The oriented 1D convolution technique is borrowed from the Oriented1D paper
+# (Kirchmeyer & Deng, ICCV 2023, https://arxiv.org/abs/2309.15812):
+#   - Learnable per-channel rotation angle theta, trained end-to-end via bilinear sampling.
+#   - Channel angles initialised with make_cyclic_angles(), cycling across N=8 evenly-spaced
+#     directions in [0, π) (channel_cycle_offset convention from the paper).
+#   - Consecutive blocks alternate orientation by 90° (layer_wise_rotation_offset, enable_layer_cycle).
 #
-# The three folders in https://github.com/princeton-vl/Oriented1D/tree/master/models all implement
-# the same underlying DepthwiseOrientedConv1d operation using custom CUDA kernels:
-#
-#   dwoconv1d             — optimised CUDA kernel (main implementation)
-#   dwoconv1d_reference   — simpler CUDA kernel for correctness testing
-#   dwoconv1d_specialized — pre-compiled CUDA for fixed spatial dimensions (fastest at known size)
-#
-# C2fDWO blocks use DWOConv1d — a pure-PyTorch equivalent that requires no custom CUDA extensions.
-# Each channel has its own learnable rotation angle theta, providing strictly more representational
-# power than the fixed horizontal+vertical decomposition used in C2f1D / OAConv.
+# All other design choices follow YOLO conventions — NOT ConvNeXt:
+#   - BatchNorm2d + SiLU after every convolution (not LayerNorm / GELU).
+#   - YOLO bottleneck: Conv(1×1, BN+SiLU) → DWOConv1d(BN+SiLU) → Conv(1×1, BN) + shortcut.
+#   - No ConvNeXt features: no 4× FFN expansion, no layer scale gamma, no LayerNorm.
+#   - C2f CSP structure and YOLO head/neck unchanged.
 #
 # Model docs: https://docs.ultralytics.com/models/yolo11
 # Task docs:  https://docs.ultralytics.com/tasks/detect
