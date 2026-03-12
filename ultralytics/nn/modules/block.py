@@ -9,7 +9,7 @@ import torch.nn.functional as F
 
 from ultralytics.utils.torch_utils import fuse_conv_and_bn
 
-from .conv import Conv, DWConv, GhostConv, LightConv, OAConv, RepConv, autopad
+from .conv import Conv, DWConv, DWOConv1d, GhostConv, LightConv, OAConv, RepConv, autopad
 from .transformer import TransformerBlock
 
 __all__ = (
@@ -31,9 +31,11 @@ __all__ = (
     "BNContrastiveHead",
     "Bottleneck",
     "Bottleneck1D",
+    "BottleneckDWO",
     "BottleneckCSP",
     "C2f",
     "C2f1D",
+    "C2fDWO",
     "C2fAttn",
     "C2fCIB",
     "C2fPSA",
@@ -2145,3 +2147,87 @@ class C2f1D(C2f):
         """
         super().__init__(c1, c2, n, shortcut, e=e)
         self.m = nn.ModuleList(Bottleneck1D(self.c, self.c, shortcut, e=1.0, k=k) for _ in range(n))
+
+
+class BottleneckDWO(nn.Module):
+    """Depthwise Oriented 1D Bottleneck block.
+
+    An inverted bottleneck (1×1 expand → DWOConv1d spatial mix → 1×1 contract) that uses the full
+    ``DWOConv1d`` module for spatial mixing.  Unlike ``Bottleneck1D`` which sums fixed horizontal and
+    vertical kernels, each channel here has a **learnable rotation angle theta** trained end-to-end —
+    directly mirroring the ``DepthwiseOrientedConv1d`` class from the three CUDA kernel folders
+    (``dwoconv1d``, ``dwoconv1d_reference``, ``dwoconv1d_specialized``) in the Oriented1D repository.
+
+    Block structure: pointwise expand (1×1 Conv) → DWOConv1d → pointwise contract (1×1 Conv).
+
+    Attributes:
+        cv1 (Conv): 1×1 pointwise expansion convolution.
+        dw (DWOConv1d): Depthwise oriented 1D convolution with learnable per-channel angle.
+        cv2 (Conv): 1×1 pointwise contraction convolution (no activation, applied after residual).
+        add (bool): Whether a residual shortcut is applied (requires c1 == c2).
+    """
+
+    def __init__(self, c1: int, c2: int, shortcut: bool = True, e: float = 0.5, k: int = 7, angle: float = 0.0):
+        """Initialize BottleneckDWO module.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int): Output channels.
+            shortcut (bool): Whether to use a residual shortcut connection (requires c1 == c2).
+            e (float): Channel expansion ratio for the hidden dimension.
+            k (int): Length of the oriented 1D kernel. Must be odd. Defaults to 7.
+            angle (float): Initial rotation angle in radians for all channels. Defaults to 0.0.
+        """
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.dw = DWOConv1d(c_, k=k, angle=angle)
+        self.cv2 = Conv(c_, c2, 1, 1, act=False)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply depthwise oriented 1D bottleneck with optional residual connection.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            (torch.Tensor): Output tensor.
+        """
+        return x + self.cv2(self.dw(self.cv1(x))) if self.add else self.cv2(self.dw(self.cv1(x)))
+
+
+class C2fDWO(C2f):
+    """C2f with Depthwise Oriented 1D Bottleneck blocks (learnable angle per channel).
+
+    A variant of C2f (CSP Bottleneck with 2 convolutions) that replaces standard Bottleneck blocks with
+    ``BottleneckDWO`` blocks, which use ``DWOConv1d`` for spatial mixing.  Each channel of the depthwise
+    convolution has a **learnable rotation angle** trained end-to-end, providing strictly more expressive
+    power than the fixed H/V decomposition used in ``C2f1D``.
+
+    This is the Ultralytics equivalent of the ConvNeXt-1D/2D/1D++/2D++ architectures evaluated in the
+    Oriented1D paper (ICCV 2023), applied to YOLO-style feature pyramids.  The three CUDA kernel folders
+    in the original repo (``dwoconv1d``, ``dwoconv1d_reference``, ``dwoconv1d_specialized``) all implement
+    the same underlying operation — this class uses a pure-PyTorch implementation that requires no custom
+    CUDA extensions.
+
+    Attributes:
+        c (int): Hidden channel width.
+        cv1 (Conv): Initial 1×1 convolution splitting input into two paths.
+        cv2 (Conv): Final 1×1 convolution fusing all paths.
+        m (nn.ModuleList): List of BottleneckDWO blocks with learnable angle parameters.
+    """
+
+    def __init__(self, c1: int, c2: int, n: int = 1, shortcut: bool = False, e: float = 0.5, k: int = 7):
+        """Initialize C2fDWO module.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int): Output channels.
+            n (int): Number of BottleneckDWO blocks.
+            shortcut (bool): Whether to use residual shortcuts in each BottleneckDWO.
+            e (float): Channel expansion ratio.
+            k (int): Oriented 1D kernel length. Must be odd. Defaults to 7.
+        """
+        super().__init__(c1, c2, n, shortcut, e=e)
+        self.m = nn.ModuleList(BottleneckDWO(self.c, self.c, shortcut, e=1.0, k=k) for _ in range(n))

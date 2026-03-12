@@ -18,6 +18,7 @@ __all__ = (
     "ConvTranspose",
     "DWConv",
     "DWConvTranspose2d",
+    "DWOConv1d",
     "Focus",
     "GhostConv",
     "Index",
@@ -259,6 +260,149 @@ class OAConv(nn.Module):
             (torch.Tensor): Output tensor.
         """
         return self.act(self.conv_h(x) + self.conv_v(x))
+
+
+class DWOConv1d(nn.Module):
+    """Depthwise Oriented 1D Convolution — pure-PyTorch implementation.
+
+    Applies a 1D depthwise convolution kernel at a **per-channel learnable angle** theta. Each channel
+    has its own angle parameter that is trained end-to-end via backpropagation through ``torch.sin`` /
+    ``torch.cos`` and ``F.grid_sample``.  This is a differentiable, CUDA-free equivalent of the three
+    ``dwoconv1d`` / ``dwoconv1d_reference`` / ``dwoconv1d_specialized`` CUDA modules from:
+
+        "Convolutional Networks with Oriented 1D Kernels", Kirchmeyer & Deng, ICCV 2023.
+        https://arxiv.org/abs/2309.15812
+
+    **How it works**: for each channel ``c`` with learnable angle ``theta_c``, the module samples the
+    input along the direction ``(cos(theta_c), sin(theta_c))`` at ``k`` evenly-spaced positions centred
+    on each output pixel, then multiplies by the 1×k learned weight and sums — exactly like a 1-D
+    depthwise convolution but applied along a rotated axis.  Sampling uses bilinear interpolation
+    (``F.grid_sample``), making the angle gradient available automatically.
+
+    The three CUDA variants in the reference repository correspond to:
+        * ``dwoconv1d``            – optimised custom CUDA kernel (fastest, GPU-only).
+        * ``dwoconv1d_reference``  – simpler reference CUDA kernel (slower, used for correctness tests).
+        * ``dwoconv1d_specialized``– pre-compiled CUDA for fixed spatial dimensions (fastest at known size).
+    This class provides an equivalent that runs on any device (CPU or CUDA) without custom extensions.
+
+    Attributes:
+        weight (nn.Parameter): 1D depthwise kernel of shape ``(channels, 1, 1, k)``.
+        theta (nn.Parameter): Per-channel rotation angle in radians, shape ``(channels,)``.
+        bn (nn.BatchNorm2d): Batch normalisation applied to the output.
+        act (nn.Module): Activation function (default SiLU).
+        channels (int): Number of input/output channels.
+        k (int): Kernel length (must be odd).
+    """
+
+    default_act = nn.SiLU()
+
+    def __init__(self, channels, k=7, angle=0.0, act=True):
+        """Initialise DWOConv1d.
+
+        Args:
+            channels (int): Number of input and output channels (depthwise — in == out).
+            k (int): 1D kernel length.  Must be odd.  Defaults to 7.
+            angle (float | torch.Tensor): Initial rotation angle(s) in radians.  A scalar initialises
+                all channels to the same angle; a ``(channels,)`` tensor sets per-channel angles.
+                Defaults to 0.0 (horizontal kernels).
+            act (bool | nn.Module): Activation function.  ``True`` uses default SiLU.
+        """
+        super().__init__()
+        assert k % 2 == 1, f"DWOConv1d kernel size k must be odd, got k={k}"
+        self.channels = channels
+        self.k = k
+
+        # 1-D depthwise weight: horizontal kernel shape (C, 1, 1, k)
+        self.weight = nn.Parameter(torch.empty(channels, 1, 1, k))
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+
+        # Learnable per-channel rotation angle (radians)
+        if isinstance(angle, (float, int)):
+            angle_t = torch.full((channels,), float(angle))
+        else:
+            angle_t = torch.as_tensor(angle, dtype=torch.float32).reshape(channels)
+        self.theta = nn.Parameter(angle_t)
+
+        self.bn = nn.BatchNorm2d(channels)
+        self.act = self.default_act if act is True else act if isinstance(act, nn.Module) else nn.Identity()
+
+    def _oriented_sample(self, x):
+        """Vectorized oriented sampling: single F.grid_sample call across all k positions.
+
+        Builds a combined sampling grid of shape ``(N*C*k, H, W, 2)`` and calls ``F.grid_sample``
+        once, then multiplies by the 1-D weights and sums across the kernel dimension.
+
+        Args:
+            x (torch.Tensor): Input of shape ``(N, C, H, W)``.
+
+        Returns:
+            (torch.Tensor): Accumulated output of shape ``(N, C, H, W)``.
+        """
+        N, C, H, W = x.shape
+        k = self.k
+        half = k // 2
+        device = x.device
+
+        # Explicit float division to avoid precision issues with integer H/W
+        norm_w = float(W) / 2.0
+        norm_h = float(H) / 2.0
+
+        offsets = torch.arange(-half, half + 1, dtype=x.dtype, device=device)  # (k,)
+        cos_t = torch.cos(self.theta).to(x.dtype)  # (C,)
+        sin_t = torch.sin(self.theta).to(x.dtype)  # (C,)
+
+        # Per-channel, per-kernel-position offsets in normalised [-1, 1] grid coords
+        dx_ck = (cos_t.unsqueeze(1) * offsets.unsqueeze(0)) / norm_w  # (C, k)
+        dy_ck = (sin_t.unsqueeze(1) * offsets.unsqueeze(0)) / norm_h  # (C, k)
+
+        # Base normalised pixel-centre grid: (H, W)
+        grid_y, grid_x = torch.meshgrid(
+            torch.linspace(-1.0, 1.0, H, dtype=x.dtype, device=device),
+            torch.linspace(-1.0, 1.0, W, dtype=x.dtype, device=device),
+            indexing="ij",
+        )
+
+        # Build all (C×k) sampling grids simultaneously: (C, k, H, W, 2)
+        sx = grid_x[None, None] + dx_ck[:, :, None, None]  # (C, k, H, W)
+        sy = grid_y[None, None] + dy_ck[:, :, None, None]  # (C, k, H, W)
+        grid_all = torch.stack([sx, sy], dim=-1).reshape(C * k, H, W, 2)  # (C*k, H, W, 2)
+
+        # Expand grid for batch dimension: (N*C*k, H, W, 2)
+        grid_all = grid_all.unsqueeze(0).expand(N, -1, -1, -1, -1).reshape(N * C * k, H, W, 2)
+
+        # Expand input: each channel is repeated k times → (N*C*k, 1, H, W)
+        x_exp = x.unsqueeze(2).expand(-1, -1, k, -1, -1).reshape(N * C * k, 1, H, W)
+
+        # Single vectorized grid_sample: (N*C*k, 1, H, W) → (N, C, k, H, W)
+        sampled = torch.nn.functional.grid_sample(
+            x_exp, grid_all, mode="bilinear", padding_mode="zeros", align_corners=True
+        ).reshape(N, C, k, H, W)
+
+        # Weighted sum over kernel dimension: weights (1, C, k, 1, 1)
+        w = self.weight[:, 0, 0, :].reshape(1, C, k, 1, 1)
+        return (sampled * w).sum(dim=2)  # (N, C, H, W)
+
+    def forward(self, x):
+        """Apply per-channel learnable-angle 1D depthwise convolution with BN and activation.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape ``(N, channels, H, W)``.
+
+        Returns:
+            (torch.Tensor): Output tensor of shape ``(N, channels, H, W)``.
+        """
+        return self.act(self.bn(self._oriented_sample(x)))
+
+    def forward_fuse(self, x):
+        """Apply per-channel learnable-angle 1D depthwise convolution and activation (no BN).
+
+        Args:
+            x (torch.Tensor): Input tensor of shape ``(N, channels, H, W)``.
+
+        Returns:
+            (torch.Tensor): Output tensor of shape ``(N, channels, H, W)``.
+        """
+        return self.act(self._oriented_sample(x))
 
 
 class DWConvTranspose2d(nn.ConvTranspose2d):
