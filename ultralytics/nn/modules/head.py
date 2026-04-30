@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from torch.nn.init import constant_, xavier_uniform_
 
 from ultralytics.utils import NOT_MACOS14
+from ultralytics.utils.ops import csl_angle_decode
 from ultralytics.utils.tal import dist2bbox, dist2rbox, make_anchors
 from ultralytics.utils.torch_utils import TORCH_1_11, fuse_conv_and_bn, smart_inference_mode
 
@@ -435,7 +436,7 @@ class OBB(Detect):
         >>> outputs = obb(x)
     """
 
-    def __init__(self, nc: int = 80, ne: int = 1, reg_max=16, end2end=False, ch: tuple = ()):
+    def __init__(self, nc: int = 80, ne: int = 1, reg_max=16, end2end=False, ch: tuple = (), angle_mode: str = "reg"):
         """Initialize OBB with number of classes `nc` and layer channels `ch`.
 
         Args:
@@ -444,9 +445,14 @@ class OBB(Detect):
             reg_max (int): Maximum number of DFL channels.
             end2end (bool): Whether to use end-to-end NMS-free detection.
             ch (tuple): Tuple of channel sizes from backbone feature maps.
+            angle_mode (str): Angle prediction mode, either "reg" or "csl".
         """
         super().__init__(nc, reg_max, end2end, ch)
         self.ne = ne  # number of extra parameters
+        self.angle_bins = ne
+        self.angle_mode = str(angle_mode).lower()
+        self.angle_min = -math.pi / 4
+        self.angle_range = math.pi
 
         c4 = max(ch[0] // 4, self.ne)
         self.cv4 = nn.ModuleList(nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3), nn.Conv2d(c4, self.ne, 1)) for x in ch)
@@ -466,9 +472,15 @@ class OBB(Detect):
     def _inference(self, x: dict[str, torch.Tensor]) -> torch.Tensor:
         """Decode predicted bounding boxes and class probabilities, concatenated with rotation angles."""
         # For decode_bboxes convenience
-        self.angle = x["angle"]  # TODO: need to test obb
+        self.angle = self.decode_angle(x["angle"])  # TODO: need to test obb
         preds = super()._inference(x)
-        return torch.cat([preds, x["angle"]], dim=1)
+        return torch.cat([preds, self.angle], dim=1)
+
+    def decode_angle(self, angle: torch.Tensor) -> torch.Tensor:
+        """Decode CSL angle logits into continuous angles when enabled."""
+        if self.angle_mode != "csl":
+            return angle
+        return csl_angle_decode(angle, self.angle_bins, angle_min=self.angle_min, angle_range=self.angle_range)
 
     def forward_head(
         self, x: list[torch.Tensor], box_head: torch.nn.Module, cls_head: torch.nn.Module, angle_head: torch.nn.Module
@@ -480,7 +492,8 @@ class OBB(Detect):
             angle = torch.cat(
                 [angle_head[i](x[i]).view(bs, self.ne, -1) for i in range(self.nl)], 2
             )  # OBB theta logits
-            angle = (angle.sigmoid() - 0.25) * math.pi  # [-pi/4, 3pi/4]
+            if self.angle_mode != "csl":
+                angle = angle.sigmoid() * self.angle_range + self.angle_min  # (angle_min, angle_min + angle_range)
             preds["angle"] = angle
         return preds
 

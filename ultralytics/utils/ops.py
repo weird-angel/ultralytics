@@ -396,6 +396,44 @@ def xywhr2xyxyxyxy(x):
     return stack([pt1, pt2, pt3, pt4], -2)
 
 
+def csl_angle_decode(
+    angle_logits: torch.Tensor,
+    angle_bins: int,
+    angle_min: float = -math.pi / 4,
+    angle_range: float = math.pi,
+) -> torch.Tensor:
+    """Decode CSL angle logits into continuous angles.
+
+    Args:
+        angle_logits (torch.Tensor): Angle logits with bins on dimension 1.
+        angle_bins (int): Number of discrete angle bins.
+        angle_min (float): Minimum angle in radians for the range.
+        angle_range (float): Total angle range in radians.
+
+    Returns:
+        (torch.Tensor): Decoded angles with shape matching logits except bins collapsed to 1.
+    """
+    if angle_bins < 1:
+        raise ValueError(f"angle_bins must be >= 1, got {angle_bins}.")
+    if angle_bins == 1:
+        return angle_logits
+    probs = angle_logits.softmax(dim=1)
+    dtype, device = probs.dtype, probs.device
+    step = angle_range / angle_bins
+    centers = angle_min + (torch.arange(angle_bins, device=device, dtype=dtype) + 0.5) * step
+    # Use circular mean on doubled angles to respect 180° periodicity.
+    sin2 = torch.sin(2 * centers)
+    cos2 = torch.cos(2 * centers)
+    shape = [1] * probs.dim()
+    shape[1] = angle_bins
+    sin2 = sin2.view(*shape)
+    cos2 = cos2.view(*shape)
+    sin_mean = (probs * sin2).sum(dim=1, keepdim=True)
+    cos_mean = (probs * cos2).sum(dim=1, keepdim=True)
+    angle = 0.5 * torch.atan2(sin_mean, cos_mean)
+    return angle_min + torch.remainder(angle - angle_min, angle_range)
+
+
 def ltwh2xyxy(x):
     """Convert bounding box from [x1, y1, w, h] to [x1, y1, x2, y2] where xy1=top-left, xy2=bottom-right.
 
