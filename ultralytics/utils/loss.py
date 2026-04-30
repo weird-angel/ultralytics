@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ultralytics.utils.metrics import OKS_SIGMA, RLE_WEIGHT
-from ultralytics.utils.ops import crop_mask, xywh2xyxy, xyxy2xywh
+from ultralytics.utils.ops import csl_angle_decode, crop_mask, xywh2xyxy, xyxy2xywh
 from ultralytics.utils.tal import RotatedTaskAlignedAssigner, TaskAlignedAssigner, dist2bbox, dist2rbox, make_anchors
 from ultralytics.utils.torch_utils import autocast
 
@@ -966,6 +966,7 @@ class v8OBBLoss(v8DetectionLoss):
     def __init__(self, model, tal_topk=10, tal_topk2: int | None = None):
         """Initialize v8OBBLoss with model, assigner, and rotated bbox loss; model must be de-paralleled."""
         super().__init__(model, tal_topk=tal_topk)
+        m = model.model[-1]
         self.assigner = RotatedTaskAlignedAssigner(
             topk=tal_topk,
             num_classes=self.nc,
@@ -975,6 +976,46 @@ class v8OBBLoss(v8DetectionLoss):
             topk2=tal_topk2,
         )
         self.bbox_loss = RotatedBboxLoss(self.reg_max).to(self.device)
+        self.angle_mode = str(getattr(m, "angle_mode", "reg")).lower()
+        self.angle_bins = getattr(m, "ne", 1)
+        self.angle_min = -math.pi / 4
+        self.angle_range = math.pi
+        self.angle_step = self.angle_range / max(self.angle_bins, 1)
+        self.csl_radius = self._get_hyp("angle_smooth_radius", 1)
+        self.csl_sigma = self._get_hyp("angle_smooth_sigma", 6.0)
+        self.csl_type = str(self._get_hyp("angle_smooth_type", "gaussian")).lower()
+
+    def _get_hyp(self, key: str, default):
+        """Return hyperparameter value from args with a safe fallback."""
+        if isinstance(self.hyp, dict):
+            return self.hyp.get(key, default)
+        return getattr(self.hyp, key, default)
+
+    def decode_angle(self, angle_logits: torch.Tensor) -> torch.Tensor:
+        """Decode angle logits for CSL mode."""
+        if self.angle_mode != "csl":
+            return angle_logits
+        return csl_angle_decode(angle_logits, self.angle_bins, angle_min=self.angle_min, angle_range=self.angle_range)
+
+    def csl_target(self, target_theta: torch.Tensor) -> torch.Tensor:
+        """Build CSL targets for angle classification."""
+        if self.angle_bins <= 1:
+            return target_theta.new_zeros((target_theta.shape[0], 1))
+        theta = torch.remainder(target_theta - self.angle_min, self.angle_range)
+        angle_index = theta / self.angle_step
+        bin_idx = torch.arange(self.angle_bins, device=target_theta.device, dtype=target_theta.dtype)
+        dist = torch.abs(bin_idx[None, :] - angle_index[:, None])
+        dist = torch.minimum(dist, self.angle_bins - dist)
+        if self.csl_type == "pulse":
+            target_bins = torch.round(angle_index).long() % self.angle_bins
+            target = torch.zeros((target_theta.shape[0], self.angle_bins), device=target_theta.device, dtype=target_theta.dtype)
+            return target.scatter_(1, target_bins.unsqueeze(1), 1.0)
+        sigma = max(float(self.csl_sigma), 1e-6)
+        target = torch.exp(-0.5 * (dist / sigma) ** 2)
+        radius = float(self.csl_radius)
+        if radius > 0:
+            target = target * (dist <= radius)
+        return target
 
     def preprocess(self, targets: torch.Tensor, batch_size: int, scale_tensor: torch.Tensor) -> torch.Tensor:
         """Preprocess targets for oriented bounding box detection."""
@@ -996,11 +1037,12 @@ class v8OBBLoss(v8DetectionLoss):
     def loss(self, preds: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         """Calculate and return the loss for oriented bounding box detection."""
         loss = torch.zeros(4, device=self.device)  # box, cls, dfl, angle
-        pred_distri, pred_scores, pred_angle = (
-            preds["boxes"].permute(0, 2, 1).contiguous(),
-            preds["scores"].permute(0, 2, 1).contiguous(),
-            preds["angle"].permute(0, 2, 1).contiguous(),
-        )
+        pred_distri = preds["boxes"].permute(0, 2, 1).contiguous()
+        pred_scores = preds["scores"].permute(0, 2, 1).contiguous()
+        pred_angle_logits = preds["angle"]
+        pred_angle = pred_angle_logits.permute(0, 2, 1).contiguous()
+        if self.angle_mode == "csl":
+            pred_angle = self.decode_angle(pred_angle_logits).permute(0, 2, 1).contiguous()
         anchor_points, stride_tensor = make_anchors(preds["feats"], self.stride, 0.5)
         batch_size = pred_angle.shape[0]  # batch size
 
@@ -1061,9 +1103,15 @@ class v8OBBLoss(v8DetectionLoss):
                 stride_tensor,
             )
             weight = target_scores.sum(-1)[fg_mask]
-            loss[3] = self.calculate_angle_loss(
-                pred_bboxes, target_bboxes, fg_mask, weight, target_scores_sum
-            )  # angle loss
+            if self.angle_mode == "csl":
+                target_theta = target_bboxes[..., 4][fg_mask]
+                target_csl = self.csl_target(target_theta)
+                pred_logits = pred_angle_logits.permute(0, 2, 1)[fg_mask]
+                loss[3] = (self.bce(pred_logits, target_csl) * weight.unsqueeze(1)).sum() / target_scores_sum
+            else:
+                loss[3] = self.calculate_angle_loss(
+                    pred_bboxes, target_bboxes, fg_mask, weight, target_scores_sum
+                )  # angle loss
         else:
             loss[0] += (pred_angle * 0).sum()
 

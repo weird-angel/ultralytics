@@ -1,6 +1,7 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
 import contextlib
+import math
 import csv
 import urllib
 from copy import copy
@@ -72,6 +73,19 @@ def test_model_profile():
     model = DetectionModel()  # build model
     im = torch.randn(1, 3, 64, 64)  # requires min imgsz=64
     _ = model.predict(im, profile=True)
+
+
+def test_csl_angle_decode():
+    """Test CSL angle decoding returns valid ranges and shapes."""
+    from ultralytics.utils.ops import csl_angle_decode
+
+    angle_bins = 180
+    logits = torch.zeros(2, angle_bins, 4)
+    logits[:, 0, :] = 10.0
+    decoded = csl_angle_decode(logits, angle_bins)
+    assert decoded.shape == (2, 1, 4)
+    assert torch.all(decoded >= -math.pi / 4)
+    assert torch.all(decoded < 3 * math.pi / 4)
 
 
 def test_predict_txt(tmp_path):

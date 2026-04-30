@@ -56,6 +56,11 @@ Train YOLO26n-obb on the DOTA8 dataset for 100 [epochs](https://www.ultralytics.
 
     OBB angles are constrained to the range **0–90 degrees** (exclusive of 90). Angles of 90 degrees or greater are not supported.
 
+!!! tip
+
+    Circular Smooth Label (CSL) angle classification is supported via `yolo26n-obb-csl.yaml` (or other scales) and the
+    `angle_mode=csl`, `angle_bins`, and `angle_smooth_*` settings in the config.
+
 !!! example
 
     === "Python"
