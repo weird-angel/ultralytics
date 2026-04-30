@@ -86,6 +86,11 @@ def test_csl_angle_decode():
     assert decoded.shape == (2, 1, 4)
     assert torch.all(decoded >= -math.pi / 4)
     assert torch.all(decoded <= 3 * math.pi / 4)
+    logits = torch.zeros(1, 4, 1)
+    logits[:, 2, :] = 20.0
+    decoded = csl_angle_decode(logits, 4)
+    expected = -math.pi / 4 + (2.5 * (math.pi / 4))
+    assert torch.allclose(decoded.squeeze(), torch.tensor(expected), atol=1e-2)
 
 
 def test_predict_txt(tmp_path):

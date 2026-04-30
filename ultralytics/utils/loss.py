@@ -977,7 +977,7 @@ class v8OBBLoss(v8DetectionLoss):
         )
         self.bbox_loss = RotatedBboxLoss(self.reg_max).to(self.device)
         self.angle_mode = str(getattr(m, "angle_mode", "reg")).lower()
-        self.angle_bins = getattr(m, "ne", 1)  # OBB head angle bins
+        self.angle_bins = getattr(m, "angle_bins", getattr(m, "ne", 1))  # OBB head angle bins
         self.angle_min = -math.pi / 4
         self.angle_range = math.pi
         self.angle_step = self.angle_range / max(self.angle_bins, 1)
@@ -986,6 +986,7 @@ class v8OBBLoss(v8DetectionLoss):
         self.csl_type = str(self._get_hyp("angle_smooth_type", "gaussian")).lower()
         if self.angle_mode == "csl" and self.angle_bins <= 1:
             raise ValueError("CSL angle_bins must be greater than 1.")
+        self.bin_idx = torch.arange(self.angle_bins, device=self.device, dtype=torch.float)
 
     def _get_hyp(self, key: str, default):
         """Return hyperparameter value from args with a safe fallback."""
@@ -1005,7 +1006,7 @@ class v8OBBLoss(v8DetectionLoss):
             raise ValueError("CSL angle_bins must be greater than 1.")
         theta = torch.remainder(target_theta - self.angle_min, self.angle_range)
         angle_index = theta / self.angle_step
-        bin_idx = torch.arange(self.angle_bins, device=target_theta.device, dtype=target_theta.dtype)
+        bin_idx = self.bin_idx.to(device=target_theta.device, dtype=target_theta.dtype)
         dist = torch.abs(bin_idx[None, :] - angle_index[:, None])
         dist = torch.minimum(dist, self.angle_bins - dist)
         if self.csl_type == "pulse":

@@ -421,6 +421,7 @@ def csl_angle_decode(
     dtype, device = probs.dtype, probs.device
     step = angle_range / angle_bins
     centers = angle_min + (torch.arange(angle_bins, device=device, dtype=dtype) + 0.5) * step
+    # Use circular mean on doubled angles to respect 180° periodicity.
     sin2 = torch.sin(2 * centers)
     cos2 = torch.cos(2 * centers)
     shape = [1] * probs.dim()
