@@ -493,7 +493,7 @@ class OBB(Detect):
                 [angle_head[i](x[i]).view(bs, self.ne, -1) for i in range(self.nl)], 2
             )  # OBB theta logits
             if self.angle_mode != "csl":
-                angle = angle.sigmoid() * self.angle_range + self.angle_min  # [angle_min, angle_min + angle_range)
+                angle = angle.sigmoid() * self.angle_range + self.angle_min  # (angle_min, angle_min + angle_range)
             preds["angle"] = angle
         return preds
 

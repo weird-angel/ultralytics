@@ -85,7 +85,7 @@ def test_csl_angle_decode():
     decoded = csl_angle_decode(logits, angle_bins)
     assert decoded.shape == (2, 1, 4)
     assert torch.all(decoded >= -math.pi / 4)
-    assert torch.all(decoded <= 3 * math.pi / 4)
+    assert torch.all(decoded < 3 * math.pi / 4)
     logits = torch.zeros(1, 4, 1)
     logits[:, 2, :] = 20.0
     decoded = csl_angle_decode(logits, 4)
