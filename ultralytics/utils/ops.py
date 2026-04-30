@@ -413,7 +413,9 @@ def csl_angle_decode(
     Returns:
         (torch.Tensor): Decoded angles with shape matching logits except bins collapsed to 1.
     """
-    if angle_bins <= 1:
+    if angle_bins < 1:
+        raise ValueError(f"angle_bins must be >= 1, got {angle_bins}.")
+    if angle_bins == 1:
         return angle_logits
     probs = angle_logits.softmax(dim=1)
     dtype, device = probs.dtype, probs.device

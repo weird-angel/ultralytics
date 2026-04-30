@@ -450,6 +450,8 @@ class OBB(Detect):
         super().__init__(nc, reg_max, end2end, ch)
         self.ne = ne  # number of extra parameters
         self.angle_mode = str(angle_mode).lower()
+        self.angle_min = -math.pi / 4
+        self.angle_range = math.pi
 
         c4 = max(ch[0] // 4, self.ne)
         self.cv4 = nn.ModuleList(nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3), nn.Conv2d(c4, self.ne, 1)) for x in ch)
@@ -477,7 +479,7 @@ class OBB(Detect):
         """Decode CSL angle logits into continuous angles when enabled."""
         if self.angle_mode != "csl":
             return angle
-        return csl_angle_decode(angle, self.ne)
+        return csl_angle_decode(angle, self.ne, angle_min=self.angle_min, angle_range=self.angle_range)
 
     def forward_head(
         self, x: list[torch.Tensor], box_head: torch.nn.Module, cls_head: torch.nn.Module, angle_head: torch.nn.Module
@@ -490,7 +492,7 @@ class OBB(Detect):
                 [angle_head[i](x[i]).view(bs, self.ne, -1) for i in range(self.nl)], 2
             )  # OBB theta logits
             if self.angle_mode != "csl":
-                angle = (angle.sigmoid() - 0.25) * math.pi  # [-pi/4, 3pi/4]
+                angle = angle.sigmoid() * self.angle_range + self.angle_min  # [-pi/4, 3pi/4]
             preds["angle"] = angle
         return preds
 
