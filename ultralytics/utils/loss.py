@@ -10,6 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ultralytics.utils.metrics import OKS_SIGMA, RLE_WEIGHT
+from ultralytics.utils.cobb import COBBCoder, rotated_box_to_bbox
 from ultralytics.utils.ops import csl_angle_decode, crop_mask, xywh2xyxy, xyxy2xywh
 from ultralytics.utils.tal import RotatedTaskAlignedAssigner, TaskAlignedAssigner, dist2bbox, dist2rbox, make_anchors
 from ultralytics.utils.torch_utils import autocast
@@ -1177,6 +1178,151 @@ class v8OBBLoss(v8DetectionLoss):
         ang_loss = ang_loss * weight
 
         return ang_loss.sum() / target_scores_sum
+
+
+class v8COBBLoss(v8DetectionLoss):
+    """Calculates losses for COBB-based oriented bounding box models."""
+
+    def __init__(self, model, tal_topk=10, tal_topk2: int | None = None):
+        """Initialize v8COBBLoss with model, assigner, and COBB coder."""
+        super().__init__(model, tal_topk=tal_topk)
+        m = model.model[-1]
+        self.assigner = RotatedTaskAlignedAssigner(
+            topk=tal_topk,
+            num_classes=self.nc,
+            alpha=0.5,
+            beta=6.0,
+            stride=self.stride.tolist(),
+            topk2=tal_topk2,
+        )
+        self.cobb_ratio_type = str(getattr(m, "cobb_ratio_type", "sig")).lower()
+        self.cobb_pow_iou = float(getattr(m, "cobb_pow_iou", 1.0))
+        self.cobb_coder = COBBCoder(pow_iou=self.cobb_pow_iou, ratio_type=self.cobb_ratio_type)
+        self.ratio_dim = int(getattr(m, "ratio_dim", 1))
+        self.score_dim = int(getattr(m, "score_dim", 4))
+        self.ratio_beta = float(self._get_hyp("cobb_ratio_beta", 0.05))
+        self.score_beta = float(self._get_hyp("cobb_score_beta", 0.05))
+
+    def _get_hyp(self, key: str, default):
+        """Return hyperparameter value from args with a safe fallback."""
+        if isinstance(self.hyp, dict):
+            return self.hyp.get(key, default)
+        return getattr(self.hyp, key, default)
+
+    def preprocess(self, targets: torch.Tensor, batch_size: int, scale_tensor: torch.Tensor) -> torch.Tensor:
+        """Preprocess targets for COBB detection."""
+        if targets.shape[0] == 0:
+            out = torch.zeros(batch_size, 0, 6, device=self.device)
+        else:
+            i = targets[:, 0]
+            _, counts = i.unique(return_counts=True)
+            counts = counts.to(dtype=torch.int32)
+            out = torch.zeros(batch_size, counts.max(), 6, device=self.device)
+            for j in range(batch_size):
+                matches = i == j
+                if n := matches.sum():
+                    bboxes = targets[matches, 2:]
+                    bboxes[..., :4].mul_(scale_tensor)
+                    out[j, :n] = torch.cat([targets[matches, 1:2], bboxes], dim=-1)
+        return out
+
+    @staticmethod
+    def _smooth_l1(pred: torch.Tensor, target: torch.Tensor, beta: float) -> torch.Tensor:
+        """Smooth L1 loss with explicit beta."""
+        diff = torch.abs(pred - target)
+        loss = torch.where(diff < beta, 0.5 * diff * diff / beta, diff - 0.5 * beta)
+        return loss
+
+    def cobb_decode(
+        self, hbboxes: torch.Tensor, ratio_pred: torch.Tensor, score_pred: torch.Tensor
+    ) -> torch.Tensor:
+        """Decode COBB predictions into rotated boxes."""
+        b, a, _ = hbboxes.shape
+        hbboxes = hbboxes.reshape(-1, 4)
+        ratio_pred = ratio_pred.reshape(-1, self.ratio_dim)
+        score_pred = score_pred.reshape(-1, self.score_dim)
+        rbboxes = self.cobb_coder.decode(hbboxes, ratio_pred, score_pred)
+        return rbboxes.view(b, a, 5)
+
+    def loss(self, preds: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+        """Calculate and return the loss for COBB-based detection."""
+        loss = torch.zeros(5, device=self.device)  # box, cls, dfl, score, ratio
+        pred_distri = preds["boxes"].permute(0, 2, 1).contiguous()
+        pred_scores = preds["scores"].permute(0, 2, 1).contiguous()
+        pred_ratio = preds["ratio"].permute(0, 2, 1).contiguous()
+        pred_cobb_score = preds["cobb_score"].permute(0, 2, 1).contiguous()
+        anchor_points, stride_tensor = make_anchors(preds["feats"], self.stride, 0.5)
+
+        dtype = pred_scores.dtype
+        imgsz = torch.tensor(preds["feats"][0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]
+        batch_size = pred_scores.shape[0]
+
+        try:
+            batch_idx = batch["batch_idx"].view(-1, 1)
+            targets = torch.cat((batch_idx, batch["cls"].view(-1, 1), batch["bboxes"].view(-1, 5)), 1)
+            rw, rh = targets[:, 4] * float(imgsz[1]), targets[:, 5] * float(imgsz[0])
+            targets = targets[(rw >= 2) & (rh >= 2)]  # filter tiny rboxes to stabilize training
+            targets = self.preprocess(targets.to(self.device), batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
+            gt_labels, gt_rboxes = targets.split((1, 5), 2)
+            mask_gt = gt_rboxes.sum(2, keepdim=True).gt_(0.0)
+        except RuntimeError as e:
+            raise TypeError(
+                "ERROR ❌ OBB dataset incorrectly formatted or not a OBB dataset.\n"
+                "This error can occur when incorrectly training a 'COBB' model on a 'detect' dataset, "
+                "i.e. 'yolo train model=yolo26n-obb-cobb.yaml data=coco8.yaml'.\nVerify your dataset is a "
+                "correctly formatted 'OBB' dataset using 'data=dota8.yaml' "
+                "as an example.\nSee https://docs.ultralytics.com/datasets/obb/ for help."
+            ) from e
+
+        pred_hbboxes = self.bbox_decode(anchor_points, pred_distri)  # xyxy in grid units
+        pred_rboxes = self.cobb_decode(pred_hbboxes, pred_ratio, pred_cobb_score)
+
+        bboxes_for_assigner = pred_rboxes.clone().detach()
+        bboxes_for_assigner[..., :4] *= stride_tensor
+
+        _, target_rboxes, target_scores, fg_mask, _ = self.assigner(
+            pred_scores.detach().sigmoid(),
+            bboxes_for_assigner.type(gt_rboxes.dtype),
+            anchor_points * stride_tensor,
+            gt_labels,
+            gt_rboxes,
+            mask_gt,
+        )
+
+        target_scores_sum = max(target_scores.sum(), 1)
+        loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum
+
+        if fg_mask.sum():
+            target_hbboxes = torch.zeros_like(target_rboxes[..., :4])
+            target_hbboxes[fg_mask] = rotated_box_to_bbox(target_rboxes[fg_mask])
+            loss[0], loss[2] = self.bbox_loss(
+                pred_distri,
+                pred_hbboxes,
+                anchor_points,
+                target_hbboxes / stride_tensor,
+                target_scores,
+                target_scores_sum,
+                fg_mask,
+                imgsz,
+                stride_tensor,
+            )
+
+            weight = target_scores.sum(-1)[fg_mask]
+            ratio_targets, score_targets = self.cobb_coder.encode(target_rboxes[fg_mask])
+            ratio_loss = self._smooth_l1(pred_ratio[fg_mask], ratio_targets, self.ratio_beta).squeeze(-1)
+            score_loss = self._smooth_l1(pred_cobb_score[fg_mask], score_targets, self.score_beta).mean(-1)
+            loss[3] = (score_loss * weight).sum() / target_scores_sum
+            loss[4] = (ratio_loss * weight).sum() / target_scores_sum
+        else:
+            loss[0] += (pred_ratio * 0).sum()
+
+        loss[0] *= self.hyp.box
+        loss[1] *= self.hyp.cls
+        loss[2] *= self.hyp.dfl
+        loss[3] *= self._get_hyp("cobb_score", 1.0)
+        loss[4] *= self._get_hyp("cobb_ratio", 1.0)
+
+        return loss * batch_size, loss.detach()
 
 
 class E2EDetectLoss:
