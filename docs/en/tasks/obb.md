@@ -61,6 +61,12 @@ Train YOLO26n-obb on the DOTA8 dataset for 100 [epochs](https://www.ultralytics.
     Circular Smooth Label (CSL) angle classification is supported via `yolo26n-obb-csl.yaml` (or other scales) and the
     `angle_mode=csl`, `angle_bins`, and `angle_smooth_*` settings in the config.
 
+!!! tip
+
+    Continuous OBB (COBB) support is available via `yolo26n-obb-cobb.yaml`, which predicts a continuous ratio and score
+    to decode rotated boxes. You can tune `cobb_ratio`, `cobb_score`, `cobb_ratio_beta`, and `cobb_score_beta` to adjust
+    COBB loss weighting and SmoothL1 behavior.
+
 !!! example
 
     === "Python"

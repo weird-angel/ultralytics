@@ -111,6 +111,10 @@ angle_bins: 180 # (int) CSL angle bins (obb tasks)
 angle_smooth_radius: 1 # (int) CSL smoothing radius in bins (obb tasks)
 angle_smooth_sigma: 6.0 # (float) CSL gaussian sigma in bins (obb tasks)
 angle_smooth_type: gaussian # (str) CSL label type: gaussian or pulse (obb tasks)
+cobb_score: 1.0 # (float) COBB score loss gain (cobb tasks)
+cobb_ratio: 1.0 # (float) COBB ratio loss gain (cobb tasks)
+cobb_score_beta: 0.05 # (float) COBB score SmoothL1 beta
+cobb_ratio_beta: 0.05 # (float) COBB ratio SmoothL1 beta
 nbs: 64 # (int) nominal batch size used for loss normalization
 hsv_h: 0.015 # (float) HSV hue augmentation fraction
 hsv_s: 0.7 # (float) HSV saturation augmentation fraction

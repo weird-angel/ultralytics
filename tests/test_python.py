@@ -93,6 +93,24 @@ def test_csl_angle_decode():
     assert torch.allclose(decoded.squeeze(), torch.tensor(expected), atol=1e-2)
 
 
+def test_cobb_coder_roundtrip():
+    """Test COBB coder encode/decode roundtrip outputs."""
+    from ultralytics.utils.cobb import COBBCoder, rotated_box_to_bbox
+
+    rboxes = torch.tensor(
+        [[10.0, 12.0, 6.0, 4.0, 0.1], [20.0, 18.0, 4.0, 7.0, -0.3]], dtype=torch.float32
+    )
+    coder = COBBCoder(pow_iou=1.0, ratio_type="sig")
+    ratio, scores = coder.encode(rboxes)
+    hbboxes = rotated_box_to_bbox(rboxes)
+    decoded = coder.decode(hbboxes, ratio, scores)
+
+    assert ratio.shape == (2, 1)
+    assert scores.shape == (2, 4)
+    assert decoded.shape == rboxes.shape
+    assert torch.allclose(decoded[:, :4], rboxes[:, :4], atol=1e-3, rtol=1e-3)
+
+
 def test_predict_txt(tmp_path):
     """Test YOLO predictions with file, directory, and pattern sources listed in a text file."""
     file = tmp_path / "sources_multi_row.txt"

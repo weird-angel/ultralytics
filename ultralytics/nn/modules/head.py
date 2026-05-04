@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from torch.nn.init import constant_, xavier_uniform_
 
 from ultralytics.utils import NOT_MACOS14
+from ultralytics.utils.cobb import COBBCoder
 from ultralytics.utils.ops import csl_angle_decode
 from ultralytics.utils.tal import dist2bbox, dist2rbox, make_anchors
 from ultralytics.utils.torch_utils import TORCH_1_11, fuse_conv_and_bn, smart_inference_mode
@@ -21,7 +22,18 @@ from .conv import Conv, DWConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
 
-__all__ = "OBB", "Classify", "Detect", "Pose", "RTDETRDecoder", "Segment", "YOLOEDetect", "YOLOESegment", "v10Detect"
+__all__ = (
+    "COBB",
+    "OBB",
+    "Classify",
+    "Detect",
+    "Pose",
+    "RTDETRDecoder",
+    "Segment",
+    "YOLOEDetect",
+    "YOLOESegment",
+    "v10Detect",
+)
 
 
 class Detect(nn.Module):
@@ -518,9 +530,122 @@ class OBB(Detect):
         angle = angle.gather(dim=1, index=idx.repeat(1, 1, self.ne))
         return torch.cat([boxes, scores, conf, angle], dim=-1)
 
+
+class COBB(Detect):
+    """YOLO COBB head for continuous rotated bounding boxes."""
+
+    def __init__(
+        self,
+        nc: int = 80,
+        ratio_dim: int = 1,
+        score_dim: int = 4,
+        ratio_act: str = "sigmoid",
+        score_act: str = "cos",
+        cobb_ratio_type: str = "sig",
+        cobb_pow_iou: float = 1.0,
+        reg_max: int = 16,
+        end2end: bool = False,
+        ch: tuple = (),
+    ) -> None:
+        super().__init__(nc, reg_max, end2end, ch)
+        self.ratio_dim = ratio_dim
+        self.score_dim = score_dim
+        self.ratio_act = str(ratio_act).lower()
+        self.score_act = str(score_act).lower()
+        self.cobb_ratio_type = str(cobb_ratio_type).lower()
+        self.cobb_pow_iou = float(cobb_pow_iou)
+        self.cobb_coder = COBBCoder(pow_iou=self.cobb_pow_iou, ratio_type=self.cobb_ratio_type)
+
+        c_ratio = max(ch[0] // 4, self.ratio_dim)
+        c_score = max(ch[0] // 4, self.score_dim)
+        self.cv4 = nn.ModuleList(
+            nn.Sequential(Conv(x, c_ratio, 3), Conv(c_ratio, c_ratio, 3), nn.Conv2d(c_ratio, self.ratio_dim, 1))
+            for x in ch
+        )
+        self.cv5 = nn.ModuleList(
+            nn.Sequential(Conv(x, c_score, 3), Conv(c_score, c_score, 3), nn.Conv2d(c_score, self.score_dim, 1))
+            for x in ch
+        )
+        if end2end:
+            self.one2one_cv4 = copy.deepcopy(self.cv4)
+            self.one2one_cv5 = copy.deepcopy(self.cv5)
+
+    @property
+    def one2many(self):
+        """Returns the one-to-many head components."""
+        return dict(box_head=self.cv2, cls_head=self.cv3, ratio_head=self.cv4, score_head=self.cv5)
+
+    @property
+    def one2one(self):
+        """Returns the one-to-one head components."""
+        return dict(
+            box_head=self.one2one_cv2,
+            cls_head=self.one2one_cv3,
+            ratio_head=self.one2one_cv4,
+            score_head=self.one2one_cv5,
+        )
+
+    def _apply_ratio_act(self, ratio: torch.Tensor) -> torch.Tensor:
+        if self.ratio_act == "sigmoid":
+            return ratio.sigmoid()
+        if self.ratio_act == "cos":
+            return torch.cos(ratio) * 0.5 + 0.5
+        if self.ratio_act == "add0.5":
+            return ratio + 0.5
+        if self.ratio_act in {"none", "raw"}:
+            return ratio
+        return ratio
+
+    def _apply_score_act(self, score: torch.Tensor) -> torch.Tensor:
+        if self.score_act == "sigmoid":
+            return score.sigmoid()
+        if self.score_act == "cos":
+            return torch.cos(score) * 0.5 + 0.5
+        if self.score_act == "add0.5":
+            return score + 0.5
+        if self.score_act == "softmax":
+            return score.softmax(dim=1)
+        if self.score_act in {"none", "raw"}:
+            return score
+        return score
+
+    def forward_head(
+        self,
+        x: list[torch.Tensor],
+        box_head: torch.nn.Module,
+        cls_head: torch.nn.Module,
+        ratio_head: torch.nn.Module,
+        score_head: torch.nn.Module,
+    ) -> dict[str, torch.Tensor]:
+        """Concatenates and returns predicted bounding boxes, class probabilities, and COBB outputs."""
+        preds = Detect.forward_head(self, x, box_head, cls_head)
+        if ratio_head is not None:
+            bs = x[0].shape[0]
+            ratio = torch.cat([ratio_head[i](x[i]).view(bs, self.ratio_dim, -1) for i in range(self.nl)], 2)
+            preds["ratio"] = self._apply_ratio_act(ratio)
+        if score_head is not None:
+            bs = x[0].shape[0]
+            score = torch.cat([score_head[i](x[i]).view(bs, self.score_dim, -1) for i in range(self.nl)], 2)
+            preds["cobb_score"] = self._apply_score_act(score)
+        return preds
+
+    def decode_bboxes(self, bboxes: torch.Tensor, anchors: torch.Tensor) -> torch.Tensor:
+        """Decode horizontal bounding boxes from predictions."""
+        return dist2bbox(bboxes, anchors, xywh=False, dim=1)
+
+    def _inference(self, x: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Decode predicted bounding boxes and class probabilities with COBB rotation."""
+        dbox = self._get_decode_boxes(x)
+        hbboxes = dbox.permute(0, 2, 1).reshape(-1, 4)
+        ratio = x["ratio"].permute(0, 2, 1).reshape(-1, self.ratio_dim)
+        scores = x["cobb_score"].permute(0, 2, 1).reshape(-1, self.score_dim)
+        rbboxes = self.cobb_coder.decode(hbboxes, ratio, scores)
+        rbboxes = rbboxes.view(dbox.shape[0], -1, 5).permute(0, 2, 1)
+        return torch.cat((rbboxes, x["scores"].sigmoid()), 1)
+
     def fuse(self) -> None:
         """Remove the one2many head for inference optimization."""
-        self.cv2 = self.cv3 = self.cv4 = None
+        self.cv2 = self.cv3 = self.cv4 = self.cv5 = None
 
 
 class OBB26(OBB):
