@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ultralytics.utils.metrics import OKS_SIGMA, RLE_WEIGHT
-from ultralytics.utils.ops import csl_angle_decode, crop_mask, xywh2xyxy, xyxy2xywh
+from ultralytics.utils.ops import acm_angle_decode, acm_angle_encode, csl_angle_decode, crop_mask, xywh2xyxy, xyxy2xywh
 from ultralytics.utils.tal import RotatedTaskAlignedAssigner, TaskAlignedAssigner, dist2bbox, dist2rbox, make_anchors
 from ultralytics.utils.torch_utils import autocast
 
@@ -987,6 +987,8 @@ class v8OBBLoss(v8DetectionLoss):
         self.csl_type = str(self._get_hyp("angle_smooth_type", "gaussian")).lower()
         if self.angle_mode == "csl" and self.angle_bins <= 1:
             raise ValueError("CSL angle_bins must be greater than 1.")
+        if self.angle_mode == "acm" and (self.angle_bins < 2 or self.angle_bins % 2 != 0):
+            raise ValueError(f"ACM angle_bins must be a positive even number (2, 4, ...), got {self.angle_bins}.")
         self._bin_idx: torch.Tensor | None = None
 
     def _get_hyp(self, key: str, default):
@@ -996,10 +998,12 @@ class v8OBBLoss(v8DetectionLoss):
         return getattr(self.hyp, key, default)
 
     def decode_angle(self, angle_logits: torch.Tensor) -> torch.Tensor:
-        """Decode angle logits for CSL mode."""
-        if self.angle_mode != "csl":
-            return angle_logits
-        return csl_angle_decode(angle_logits, self.angle_bins, angle_min=self.angle_min, angle_range=self.angle_range)
+        """Decode angle logits for CSL or ACM mode."""
+        if self.angle_mode == "csl":
+            return csl_angle_decode(angle_logits, self.angle_bins, angle_min=self.angle_min, angle_range=self.angle_range)
+        if self.angle_mode == "acm":
+            return acm_angle_decode(angle_logits, angle_min=self.angle_min, angle_range=self.angle_range)
+        return angle_logits
 
     def csl_target(self, target_theta: torch.Tensor) -> torch.Tensor:
         """Build CSL targets for angle classification."""
@@ -1023,6 +1027,21 @@ class v8OBBLoss(v8DetectionLoss):
         if radius > 0:
             target = target * (dist <= radius)
         return target
+
+    def acm_target(self, target_theta: torch.Tensor) -> torch.Tensor:
+        """Build ACM targets by encoding target angles as multi-frequency sinusoidals.
+
+        Encodes each target angle θ as [cos(2θ), sin(2θ)] (for num_freqs=1) or
+        [cos(2θ), sin(2θ), cos(4θ), sin(4θ)] (for num_freqs=2, i.e. dual-frequency ACM).
+
+        Args:
+            target_theta (torch.Tensor): Target angles with shape (N,) in radians.
+
+        Returns:
+            (torch.Tensor): ACM encoding with shape (N, angle_bins).
+        """
+        num_freqs = self.angle_bins // 2
+        return acm_angle_encode(target_theta, num_freqs=num_freqs)  # (N, angle_bins)
 
     def preprocess(self, targets: torch.Tensor, batch_size: int, scale_tensor: torch.Tensor) -> torch.Tensor:
         """Preprocess targets for oriented bounding box detection."""
@@ -1048,7 +1067,7 @@ class v8OBBLoss(v8DetectionLoss):
         pred_scores = preds["scores"].permute(0, 2, 1).contiguous()
         pred_angle_logits = preds["angle"]
         pred_angle = pred_angle_logits.permute(0, 2, 1).contiguous()
-        if self.angle_mode == "csl":
+        if self.angle_mode in ("csl", "acm"):
             pred_angle = self.decode_angle(pred_angle_logits).permute(0, 2, 1).contiguous()
         anchor_points, stride_tensor = make_anchors(preds["feats"], self.stride, 0.5)
         batch_size = pred_angle.shape[0]  # batch size
@@ -1115,6 +1134,13 @@ class v8OBBLoss(v8DetectionLoss):
                 target_csl = self.csl_target(target_theta)
                 pred_logits = pred_angle_logits.permute(0, 2, 1)[fg_mask]
                 loss[3] = (self.bce(pred_logits, target_csl) * weight.unsqueeze(1)).sum() / target_scores_sum
+            elif self.angle_mode == "acm":
+                target_theta = target_bboxes[..., 4][fg_mask]
+                target_acm = self.acm_target(target_theta)  # (N, angle_bins)
+                pred_logits = pred_angle_logits.permute(0, 2, 1)[fg_mask]  # (N, angle_bins)
+                loss[3] = (
+                    F.smooth_l1_loss(pred_logits, target_acm, reduction="none") * weight.unsqueeze(1)
+                ).sum() / target_scores_sum
             else:
                 loss[3] = self.calculate_angle_loss(
                     pred_bboxes, target_bboxes, fg_mask, weight, target_scores_sum

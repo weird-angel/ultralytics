@@ -434,6 +434,59 @@ def csl_angle_decode(
     return angle_min + torch.remainder(angle - angle_min, angle_range)
 
 
+def acm_angle_encode(theta: torch.Tensor, num_freqs: int = 1) -> torch.Tensor:
+    """Encode angles using ACM (Angle Coder with Modulation) multi-frequency sinusoidal encoding.
+
+    Produces a continuous encoding that avoids the boundary discontinuity problem in oriented object
+    detection. For num_freqs=1 the encoding is [cos(2θ), sin(2θ)]; for num_freqs=2 the encoding is
+    [cos(2θ), sin(2θ), cos(4θ), sin(4θ)] (dual-frequency variant).
+
+    Reference:
+        Xu et al., "Rethinking Boundary Discontinuity Problem for Oriented Object Detection", CVPR 2024.
+        https://github.com/Pandora-CV/cvpr24acm
+
+    Args:
+        theta (torch.Tensor): Target angles with shape (...,) in radians.
+        num_freqs (int): Number of frequency components (1 → 2 output channels, 2 → 4 output channels).
+
+    Returns:
+        (torch.Tensor): Encoded angles with shape (..., 2 * num_freqs).
+    """
+    components = []
+    for k in range(1, num_freqs + 1):
+        components.append(torch.cos(2 * k * theta))
+        components.append(torch.sin(2 * k * theta))
+    return torch.stack(components, dim=-1)
+
+
+def acm_angle_decode(
+    encoding: torch.Tensor,
+    angle_min: float = -math.pi / 4,
+    angle_range: float = math.pi,
+) -> torch.Tensor:
+    """Decode ACM sinusoidal encoding into continuous angles.
+
+    Inverts the acm_angle_encode transformation using the first frequency pair [cos(2θ), sin(2θ)]
+    and maps the result into [angle_min, angle_min + angle_range).
+
+    Args:
+        encoding (torch.Tensor): Encoded angles with shape (bs, ne, h*w) where ne >= 2 and the
+            first two channels along dimension 1 are [cos(2θ), sin(2θ)].
+        angle_min (float): Minimum angle in radians.
+        angle_range (float): Total angle range in radians.
+
+    Returns:
+        (torch.Tensor): Decoded angles with shape (bs, 1, h*w).
+    """
+    cos_2theta = encoding[:, 0:1]  # (bs, 1, h*w)
+    sin_2theta = encoding[:, 1:2]  # (bs, 1, h*w)
+    two_theta = torch.atan2(sin_2theta, cos_2theta)  # in (-π, π]
+    # Map from (-π, π] to [2*angle_min, 2*angle_min + 2*angle_range)
+    lower = 2.0 * angle_min
+    two_theta = torch.where(two_theta < lower, two_theta + 2.0 * math.pi, two_theta)
+    return two_theta / 2.0
+
+
 def ltwh2xyxy(x):
     """Convert bounding box from [x1, y1, w, h] to [x1, y1, x2, y2] where xy1=top-left, xy2=bottom-right.
 

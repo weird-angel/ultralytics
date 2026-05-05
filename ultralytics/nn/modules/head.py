@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from torch.nn.init import constant_, xavier_uniform_
 
 from ultralytics.utils import NOT_MACOS14
-from ultralytics.utils.ops import csl_angle_decode
+from ultralytics.utils.ops import acm_angle_decode, csl_angle_decode
 from ultralytics.utils.tal import dist2bbox, dist2rbox, make_anchors
 from ultralytics.utils.torch_utils import TORCH_1_11, fuse_conv_and_bn, smart_inference_mode
 
@@ -477,10 +477,12 @@ class OBB(Detect):
         return torch.cat([preds, self.angle], dim=1)
 
     def decode_angle(self, angle: torch.Tensor) -> torch.Tensor:
-        """Decode CSL angle logits into continuous angles when enabled."""
-        if self.angle_mode != "csl":
-            return angle
-        return csl_angle_decode(angle, self.angle_bins, angle_min=self.angle_min, angle_range=self.angle_range)
+        """Decode CSL or ACM angle logits into continuous angles when enabled."""
+        if self.angle_mode == "csl":
+            return csl_angle_decode(angle, self.angle_bins, angle_min=self.angle_min, angle_range=self.angle_range)
+        if self.angle_mode == "acm":
+            return acm_angle_decode(angle, angle_min=self.angle_min, angle_range=self.angle_range)
+        return angle
 
     def forward_head(
         self, x: list[torch.Tensor], box_head: torch.nn.Module, cls_head: torch.nn.Module, angle_head: torch.nn.Module
@@ -492,7 +494,7 @@ class OBB(Detect):
             angle = torch.cat(
                 [angle_head[i](x[i]).view(bs, self.ne, -1) for i in range(self.nl)], 2
             )  # OBB theta logits
-            if self.angle_mode != "csl":
+            if self.angle_mode not in {"csl", "acm"}:
                 angle = angle.sigmoid() * self.angle_range + self.angle_min  # (angle_min, angle_min + angle_range)
             preds["angle"] = angle
         return preds
@@ -505,17 +507,18 @@ class OBB(Detect):
         """Post-process YOLO model predictions.
 
         Args:
-            preds (torch.Tensor): Raw predictions with shape (batch_size, num_anchors, 4 + nc + ne) with last dimension
-                format [x, y, w, h, class_probs, angle].
+            preds (torch.Tensor): Raw predictions with shape (batch_size, num_anchors, 4 + nc + 1) with last dimension
+                format [x, y, w, h, class_probs, angle]. The angle column is always the decoded 1-channel angle
+                regardless of the angle_mode (reg/csl/acm), since decode_angle is applied before postprocess.
 
         Returns:
             (torch.Tensor): Processed predictions with shape (batch_size, min(max_det, num_anchors), 7) and last
                 dimension format [x, y, w, h, max_class_prob, class_index, angle].
         """
-        boxes, scores, angle = preds.split([4, self.nc, self.ne], dim=-1)
+        boxes, scores, angle = preds.split([4, self.nc, 1], dim=-1)  # angle is always 1 decoded channel
         scores, conf, idx = self.get_topk_index(scores, self.max_det)
         boxes = boxes.gather(dim=1, index=idx.repeat(1, 1, 4))
-        angle = angle.gather(dim=1, index=idx.repeat(1, 1, self.ne))
+        angle = angle.gather(dim=1, index=idx)
         return torch.cat([boxes, scores, conf, angle], dim=-1)
 
     def fuse(self) -> None:
