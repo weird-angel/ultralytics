@@ -1554,7 +1554,9 @@ def parse_model(d, ch, verbose=True):
     legacy = True  # backward compatibility for v3/v5/v8/v9 models
     max_channels = float("inf")
     nc, act, scales, end2end = (d.get(x) for x in ("nc", "activation", "scales", "end2end"))
-    angle_bins, angle_mode = (d.get(x) for x in ("angle_bins", "angle_mode"))
+    angle_bins, angle_mode, psc_num_step, psc_dual_freq, psc_thr_mod = (
+        d.get(x) for x in ("angle_bins", "angle_mode", "psc_num_step", "psc_dual_freq", "psc_thr_mod")
+    )
     reg_max = d.get("reg_max", 16)
     depth, width, kpt_shape = (d.get(x, 1.0) for x in ("depth_multiple", "width_multiple", "kpt_shape"))
     scale = d.get("scale")
@@ -1694,7 +1696,18 @@ def parse_model(d, ch, verbose=True):
                 OBB26,
             }
         ):
+            if m in {OBB, OBB26}:
+                if len(args) < 3:
+                    args.append(angle_mode or "reg")
             args.extend([reg_max, end2end, [ch[x] for x in f]])
+            if m in {OBB, OBB26} and str(args[2]).lower() == "psc":
+                args.extend(
+                    [
+                        psc_num_step if psc_num_step is not None else 3,
+                        psc_dual_freq if psc_dual_freq is not None else True,
+                        psc_thr_mod if psc_thr_mod is not None else 0.47,
+                    ]
+                )
             if m is Segment or m is YOLOESegment or m is Segment26 or m is YOLOESegment26:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
             if m in {Detect, YOLOEDetect, Segment, Segment26, YOLOESegment, YOLOESegment26, Pose, Pose26, OBB, OBB26}:

@@ -440,10 +440,10 @@ class OBB(Detect):
         self,
         nc: int = 80,
         ne: int = 1,
+        angle_mode: str = "reg",
         reg_max=16,
         end2end=False,
         ch: tuple = (),
-        angle_mode: str = "reg",
         psc_num_step: int = 3,
         psc_dual_freq: bool = True,
         psc_thr_mod: float = 0.47,
@@ -453,10 +453,10 @@ class OBB(Detect):
         Args:
             nc (int): Number of classes.
             ne (int): Number of extra parameters.
+            angle_mode (str): Angle prediction mode, one of "reg", "csl", or "psc".
             reg_max (int): Maximum number of DFL channels.
             end2end (bool): Whether to use end-to-end NMS-free detection.
             ch (tuple): Tuple of channel sizes from backbone feature maps.
-            angle_mode (str): Angle prediction mode, one of "reg", "csl", or "psc".
         """
         super().__init__(nc, reg_max, end2end, ch)
         self.ne = ne  # number of extra parameters

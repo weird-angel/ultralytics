@@ -439,7 +439,16 @@ def psc_angle_encode(
     num_step: int = 3,
     dual_freq: bool = True,
 ) -> torch.Tensor:
-    """Encode target angles using phase-shifting coding (PSC)."""
+    """Encode target angles using phase-shifting coding (PSC).
+
+    Args:
+        angle_targets (torch.Tensor): Target angles in radians with trailing singleton channel, e.g. (..., 1).
+        num_step (int): Number of phase steps for each frequency branch.
+        dual_freq (bool): If True, append a second frequency branch for square-like disambiguation.
+
+    Returns:
+        (torch.Tensor): PSC-encoded targets with trailing channel size `num_step` or `2 * num_step`.
+    """
     if num_step < 1:
         raise ValueError(f"num_step must be >= 1, got {num_step}.")
     phase_targets = angle_targets * 2
@@ -461,7 +470,18 @@ def psc_angle_decode(
     thr_mod: float = 0.47,
     dim: int = 1,
 ) -> torch.Tensor:
-    """Decode phase-shifting coding (PSC) predictions into continuous angles."""
+    """Decode phase-shifting coding (PSC) predictions into continuous angles.
+
+    Args:
+        angle_preds (torch.Tensor): PSC predictions containing encoded channels on `dim`.
+        num_step (int): Number of phase steps for each frequency branch.
+        dual_freq (bool): If True, decode with dual-frequency unwrapping.
+        thr_mod (float): Modulation threshold below which decoded angles are zeroed.
+        dim (int): Channel dimension containing PSC encoded values.
+
+    Returns:
+        (torch.Tensor): Decoded angles in radians with the channel dimension collapsed to size 1.
+    """
     if num_step < 1:
         raise ValueError(f"num_step must be >= 1, got {num_step}.")
     expected = num_step * (2 if dual_freq else 1)
