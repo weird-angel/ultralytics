@@ -99,7 +99,7 @@ def test_psc_angle_codec():
 
     target = torch.tensor([[-0.31], [0.42]], dtype=torch.float32)
     encoded = psc_angle_encode(target, num_step=3, dual_freq=True)
-    decoded = psc_angle_decode(encoded.unsqueeze(-1), num_step=3, dual_freq=True, thr_mod=0.0, dim=1).squeeze(-1)
+    decoded = psc_angle_decode(encoded, num_step=3, dual_freq=True, thr_mod=0.0, dim=-1)
     delta = decoded - target
     delta = delta - torch.round(delta / math.pi) * math.pi
     assert torch.allclose(delta, torch.zeros_like(delta), atol=1e-3)
