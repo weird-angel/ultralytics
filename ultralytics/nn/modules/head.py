@@ -457,6 +457,9 @@ class OBB(Detect):
             reg_max (int): Maximum number of DFL channels.
             end2end (bool): Whether to use end-to-end NMS-free detection.
             ch (tuple): Tuple of channel sizes from backbone feature maps.
+            psc_num_step (int): Number of phase steps for PSC mode.
+            psc_dual_freq (bool): Whether PSC uses dual-frequency decoding.
+            psc_thr_mod (float): PSC modulation threshold for isotropic-object angle suppression.
         """
         angle_mode, reg_max, end2end, ch = self._resolve_legacy_init_args(angle_mode, reg_max, end2end, ch)
 
@@ -509,7 +512,7 @@ class OBB(Detect):
         return torch.cat([preds, self.angle], dim=1)
 
     def decode_angle(self, angle: torch.Tensor) -> torch.Tensor:
-        """Decode CSL angle logits into continuous angles when enabled."""
+        """Decode CSL/PSC angle predictions into continuous angles when enabled."""
         if self.angle_mode == "csl":
             return csl_angle_decode(angle, self.angle_bins, angle_min=self.angle_min, angle_range=self.angle_range)
         if self.angle_mode == "psc":

@@ -1003,7 +1003,7 @@ class v8OBBLoss(v8DetectionLoss):
         return getattr(self.hyp, key, default)
 
     def decode_angle(self, angle_logits: torch.Tensor) -> torch.Tensor:
-        """Decode angle logits for CSL/PSC modes."""
+        """Decode angles for CSL/PSC modes and pass through raw logits for regression mode."""
         if self.angle_mode == "csl":
             return csl_angle_decode(angle_logits, self.angle_bins, angle_min=self.angle_min, angle_range=self.angle_range)
         if self.angle_mode == "psc":
