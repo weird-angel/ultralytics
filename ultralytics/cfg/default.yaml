@@ -106,11 +106,14 @@ pose: 12.0 # (float) pose loss gain (pose tasks)
 kobj: 1.0 # (float) keypoint objectness loss gain (pose tasks)
 rle: 1.0 # (float) rle loss gain (pose tasks)
 angle: 1.0 # (float) oriented angle loss gain (obb tasks)
-angle_mode: reg # (str) angle prediction mode: reg or csl (obb tasks)
+angle_mode: reg # (str) angle prediction mode: reg, csl, or psc (obb tasks)
 angle_bins: 180 # (int) CSL angle bins (obb tasks)
 angle_smooth_radius: 1 # (int) CSL smoothing radius in bins (obb tasks)
 angle_smooth_sigma: 6.0 # (float) CSL gaussian sigma in bins (obb tasks)
 angle_smooth_type: gaussian # (str) CSL label type: gaussian or pulse (obb tasks)
+psc_num_step: 3 # (int) PSC phase steps (obb tasks)
+psc_dual_freq: True # (bool) use dual-frequency PSC encoding (obb tasks)
+psc_thr_mod: 0.47 # (float) PSC modulation threshold for isotropic boxes (obb tasks)
 nbs: 64 # (int) nominal batch size used for loss normalization
 hsv_h: 0.015 # (float) HSV hue augmentation fraction
 hsv_s: 0.7 # (float) HSV saturation augmentation fraction

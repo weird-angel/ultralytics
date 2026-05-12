@@ -434,6 +434,64 @@ def csl_angle_decode(
     return angle_min + torch.remainder(angle - angle_min, angle_range)
 
 
+def psc_angle_encode(
+    angle_targets: torch.Tensor,
+    num_step: int = 3,
+    dual_freq: bool = True,
+) -> torch.Tensor:
+    """Encode target angles using phase-shifting coding (PSC)."""
+    if num_step < 1:
+        raise ValueError(f"num_step must be >= 1, got {num_step}.")
+    phase_targets = angle_targets * 2
+    phase_shift_targets = tuple(
+        torch.cos(phase_targets + 2 * math.pi * x / num_step) for x in range(num_step)
+    )
+    if dual_freq:
+        phase_targets = angle_targets * 4
+        phase_shift_targets += tuple(
+            torch.cos(phase_targets + 2 * math.pi * x / num_step) for x in range(num_step)
+        )
+    return torch.cat(phase_shift_targets, dim=-1)
+
+
+def psc_angle_decode(
+    angle_preds: torch.Tensor,
+    num_step: int = 3,
+    dual_freq: bool = True,
+    thr_mod: float = 0.47,
+    dim: int = 1,
+) -> torch.Tensor:
+    """Decode phase-shifting coding (PSC) predictions into continuous angles."""
+    if num_step < 1:
+        raise ValueError(f"num_step must be >= 1, got {num_step}.")
+    expected = num_step * (2 if dual_freq else 1)
+    if angle_preds.size(dim) != expected:
+        raise ValueError(f"PSC expects {expected} channels on dim={dim}, got {angle_preds.size(dim)}.")
+
+    preds = angle_preds.movedim(dim, -1)
+    dtype, device = preds.dtype, preds.device
+    coef = 2 * torch.arange(num_step, dtype=dtype, device=device) * math.pi / num_step
+    coef_sin = torch.sin(coef)
+    coef_cos = torch.cos(coef)
+
+    phase_sin = (preds[..., :num_step] * coef_sin).sum(dim=-1, keepdim=True)
+    phase_cos = (preds[..., :num_step] * coef_cos).sum(dim=-1, keepdim=True)
+    phase_mod = phase_cos.square() + phase_sin.square()
+    phase = -torch.atan2(phase_sin, phase_cos)
+
+    if dual_freq:
+        phase_sin = (preds[..., num_step : 2 * num_step] * coef_sin).sum(dim=-1, keepdim=True)
+        phase_cos = (preds[..., num_step : 2 * num_step] * coef_cos).sum(dim=-1, keepdim=True)
+        phase_mod = phase_cos.square() + phase_sin.square()
+        phase2 = -torch.atan2(phase_sin, phase_cos) / 2
+        idx = torch.cos(phase) * torch.cos(phase2) + torch.sin(phase) * torch.sin(phase2) < 0
+        phase2 = torch.where(idx, torch.remainder(phase2, 2 * math.pi) - math.pi, phase2)
+        phase = phase2
+
+    phase = torch.where(phase_mod < thr_mod, torch.zeros_like(phase), phase)
+    return (phase / 2).movedim(-1, dim)
+
+
 def ltwh2xyxy(x):
     """Convert bounding box from [x1, y1, w, h] to [x1, y1, x2, y2] where xy1=top-left, xy2=bottom-right.
 

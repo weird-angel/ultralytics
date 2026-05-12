@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ultralytics.utils.metrics import OKS_SIGMA, RLE_WEIGHT
-from ultralytics.utils.ops import csl_angle_decode, crop_mask, xywh2xyxy, xyxy2xywh
+from ultralytics.utils.ops import csl_angle_decode, crop_mask, psc_angle_decode, psc_angle_encode, xywh2xyxy, xyxy2xywh
 from ultralytics.utils.tal import RotatedTaskAlignedAssigner, TaskAlignedAssigner, dist2bbox, dist2rbox, make_anchors
 from ultralytics.utils.torch_utils import autocast
 
@@ -985,8 +985,15 @@ class v8OBBLoss(v8DetectionLoss):
         self.csl_radius = self._get_hyp("angle_smooth_radius", 1)
         self.csl_sigma = self._get_hyp("angle_smooth_sigma", 6.0)
         self.csl_type = str(self._get_hyp("angle_smooth_type", "gaussian")).lower()
+        self.psc_num_step = int(getattr(m, "psc_num_step", self._get_hyp("psc_num_step", 3)))
+        self.psc_dual_freq = bool(getattr(m, "psc_dual_freq", self._get_hyp("psc_dual_freq", True)))
+        self.psc_thr_mod = float(getattr(m, "psc_thr_mod", self._get_hyp("psc_thr_mod", 0.47)))
         if self.angle_mode == "csl" and self.angle_bins <= 1:
             raise ValueError("CSL angle_bins must be greater than 1.")
+        if self.angle_mode == "psc":
+            expected = self.psc_num_step * (2 if self.psc_dual_freq else 1)
+            if self.angle_bins != expected:
+                raise ValueError(f"PSC expects angle_bins={expected}, got {self.angle_bins}.")
         self._bin_idx: torch.Tensor | None = None
 
     def _get_hyp(self, key: str, default):
@@ -996,10 +1003,18 @@ class v8OBBLoss(v8DetectionLoss):
         return getattr(self.hyp, key, default)
 
     def decode_angle(self, angle_logits: torch.Tensor) -> torch.Tensor:
-        """Decode angle logits for CSL mode."""
-        if self.angle_mode != "csl":
-            return angle_logits
-        return csl_angle_decode(angle_logits, self.angle_bins, angle_min=self.angle_min, angle_range=self.angle_range)
+        """Decode angle logits for CSL/PSC modes."""
+        if self.angle_mode == "csl":
+            return csl_angle_decode(angle_logits, self.angle_bins, angle_min=self.angle_min, angle_range=self.angle_range)
+        if self.angle_mode == "psc":
+            return psc_angle_decode(
+                angle_logits,
+                num_step=self.psc_num_step,
+                dual_freq=self.psc_dual_freq,
+                thr_mod=self.psc_thr_mod,
+                dim=1,
+            )
+        return angle_logits
 
     def csl_target(self, target_theta: torch.Tensor) -> torch.Tensor:
         """Build CSL targets for angle classification."""
@@ -1023,6 +1038,10 @@ class v8OBBLoss(v8DetectionLoss):
         if radius > 0:
             target = target * (dist <= radius)
         return target
+
+    def psc_target(self, target_theta: torch.Tensor) -> torch.Tensor:
+        """Build PSC targets for angle regression."""
+        return psc_angle_encode(target_theta, num_step=self.psc_num_step, dual_freq=self.psc_dual_freq)
 
     def preprocess(self, targets: torch.Tensor, batch_size: int, scale_tensor: torch.Tensor) -> torch.Tensor:
         """Preprocess targets for oriented bounding box detection."""
@@ -1048,7 +1067,7 @@ class v8OBBLoss(v8DetectionLoss):
         pred_scores = preds["scores"].permute(0, 2, 1).contiguous()
         pred_angle_logits = preds["angle"]
         pred_angle = pred_angle_logits.permute(0, 2, 1).contiguous()
-        if self.angle_mode == "csl":
+        if self.angle_mode in {"csl", "psc"}:
             pred_angle = self.decode_angle(pred_angle_logits).permute(0, 2, 1).contiguous()
         anchor_points, stride_tensor = make_anchors(preds["feats"], self.stride, 0.5)
         batch_size = pred_angle.shape[0]  # batch size
@@ -1115,6 +1134,11 @@ class v8OBBLoss(v8DetectionLoss):
                 target_csl = self.csl_target(target_theta)
                 pred_logits = pred_angle_logits.permute(0, 2, 1)[fg_mask]
                 loss[3] = (self.bce(pred_logits, target_csl) * weight.unsqueeze(1)).sum() / target_scores_sum
+            elif self.angle_mode == "psc":
+                target_theta = target_bboxes[..., 4][fg_mask].unsqueeze(-1)
+                target_psc = self.psc_target(target_theta)
+                pred_psc = pred_angle_logits.permute(0, 2, 1)[fg_mask]
+                loss[3] = (F.l1_loss(pred_psc, target_psc, reduction="none") * weight.unsqueeze(1)).sum() / target_scores_sum
             else:
                 loss[3] = self.calculate_angle_loss(
                     pred_bboxes, target_bboxes, fg_mask, weight, target_scores_sum

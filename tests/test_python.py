@@ -93,6 +93,21 @@ def test_csl_angle_decode():
     assert torch.allclose(decoded.squeeze(), torch.tensor(expected), atol=1e-2)
 
 
+def test_psc_angle_codec():
+    """Test PSC angle encoding/decoding behaves correctly."""
+    from ultralytics.utils.ops import psc_angle_decode, psc_angle_encode
+
+    target = torch.tensor([[-0.31], [0.42]], dtype=torch.float32)
+    encoded = psc_angle_encode(target, num_step=3, dual_freq=True)
+    decoded = psc_angle_decode(encoded.unsqueeze(-1), num_step=3, dual_freq=True, thr_mod=0.0, dim=1).squeeze(-1)
+    delta = decoded - target
+    delta = delta - torch.round(delta / math.pi) * math.pi
+    assert torch.allclose(delta, torch.zeros_like(delta), atol=1e-3)
+
+    low_mod = torch.zeros(1, 6, 1)
+    decoded_low_mod = psc_angle_decode(low_mod, num_step=3, dual_freq=True, thr_mod=0.47, dim=1)
+    assert torch.allclose(decoded_low_mod, torch.zeros_like(decoded_low_mod))
+
 def test_predict_txt(tmp_path):
     """Test YOLO predictions with file, directory, and pattern sources listed in a text file."""
     file = tmp_path / "sources_multi_row.txt"

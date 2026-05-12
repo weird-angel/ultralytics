@@ -61,6 +61,11 @@ Train YOLO26n-obb on the DOTA8 dataset for 100 [epochs](https://www.ultralytics.
     Circular Smooth Label (CSL) angle classification is supported via `yolo26n-obb-csl.yaml` (or other scales) and the
     `angle_mode=csl`, `angle_bins`, and `angle_smooth_*` settings in the config.
 
+!!! tip
+
+    Phase-Shifting Coder (PSC) angle encoding is supported with `angle_mode=psc` using `angle_bins=6` (default
+    `psc_num_step=3`, `psc_dual_freq=True`) plus optional `psc_thr_mod` tuning.
+
 !!! example
 
     === "Python"
