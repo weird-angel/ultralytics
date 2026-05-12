@@ -458,14 +458,7 @@ class OBB(Detect):
             end2end (bool): Whether to use end-to-end NMS-free detection.
             ch (tuple): Tuple of channel sizes from backbone feature maps.
         """
-        # Backward compatibility for legacy positional constructor calls:
-        # OBB(nc, ne, reg_max, end2end, ch[, angle_mode]).
-        if not isinstance(angle_mode, str):
-            legacy_reg_max = int(angle_mode)
-            legacy_end2end = bool(reg_max)
-            legacy_ch = end2end if isinstance(end2end, (list, tuple)) else ch
-            angle_mode = ch if isinstance(ch, str) else "reg"
-            reg_max, end2end, ch = legacy_reg_max, legacy_end2end, legacy_ch
+        angle_mode, reg_max, end2end, ch = self._resolve_legacy_init_args(angle_mode, reg_max, end2end, ch)
 
         super().__init__(nc, reg_max, end2end, ch)
         self.ne = ne  # number of extra parameters
@@ -485,6 +478,18 @@ class OBB(Detect):
         self.cv4 = nn.ModuleList(nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3), nn.Conv2d(c4, self.ne, 1)) for x in ch)
         if end2end:
             self.one2one_cv4 = copy.deepcopy(self.cv4)
+
+    @staticmethod
+    def _resolve_legacy_init_args(angle_mode, reg_max, end2end, ch):
+        """Resolve backward-compatible positional constructor arguments."""
+        # Legacy positional form: OBB(nc, ne, reg_max, end2end, ch[, angle_mode]).
+        if isinstance(angle_mode, str):
+            return angle_mode, reg_max, end2end, ch
+        legacy_reg_max = int(angle_mode)
+        legacy_end2end = bool(reg_max)
+        legacy_ch = end2end if isinstance(end2end, (list, tuple)) else ch
+        legacy_angle_mode = ch if isinstance(ch, str) else "reg"
+        return legacy_angle_mode, legacy_reg_max, legacy_end2end, legacy_ch
 
     @property
     def one2many(self):

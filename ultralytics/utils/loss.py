@@ -1138,6 +1138,7 @@ class v8OBBLoss(v8DetectionLoss):
                 target_theta = target_bboxes[..., 4][fg_mask].unsqueeze(-1)
                 target_psc = self.psc_target(target_theta)
                 pred_psc = pred_angle_logits.permute(0, 2, 1)[fg_mask]
+                # PSC predicts continuous phase-shift patterns, so angle supervision is regression (L1) in code space.
                 loss[3] = (F.l1_loss(pred_psc, target_psc, reduction="none") * weight.unsqueeze(1)).sum() / target_scores_sum
             else:
                 loss[3] = self.calculate_angle_loss(

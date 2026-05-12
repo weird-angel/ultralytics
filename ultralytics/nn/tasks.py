@@ -1697,7 +1697,8 @@ def parse_model(d, ch, verbose=True):
             }
         ):
             if m in {OBB, OBB26}:
-                # Ensure args[2] is angle_mode for OBB/OBB26 when YAML head args are [nc, ne].
+                # OBB YAML heads commonly use [nc, ne]. The OBB constructor expects angle_mode as the 3rd positional
+                # argument, so inject it here when absent (len(args) < 3) before appending shared Detect args.
                 if len(args) < 3:
                     args.append(angle_mode or "reg")
             args.extend([reg_max, end2end, [ch[x] for x in f]])

@@ -504,6 +504,7 @@ def psc_angle_decode(
         phase_cos = (preds[..., num_step : 2 * num_step] * coef_cos).sum(dim=-1, keepdim=True)
         phase_mod = phase_cos.square() + phase_sin.square()
         phase2 = -torch.atan2(phase_sin, phase_cos) / 2
+        # If cos(phase - phase2) < 0, phase and phase2 are obtuse; shift phase2 by pi for dual-frequency unwrapping.
         idx = torch.cos(phase) * torch.cos(phase2) + torch.sin(phase) * torch.sin(phase2) < 0
         phase2 = torch.where(idx, torch.remainder(phase2, 2 * math.pi) - math.pi, phase2)
         phase = phase2
